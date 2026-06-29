@@ -1,0 +1,7 @@
+2026/06/29-12:17:20.833 148e4 Reusing MANIFEST /home/ferxan/Downloads/ferxvis/ferxvis/whatsapp_session/Default/Local Storage/leveldb/MANIFEST-000001
+2026/06/29-12:17:20.838 148e4 Recovering log #3
+2026/06/29-12:17:20.839 148e4 Level-0 table #3: started
+2026/06/29-12:17:20.840 148e4 Level-0 table #3: 19777 bytes OK
+2026/06/29-12:17:20.840 148e4 Recovering log #4
+2026/06/29-12:17:20.841 148e4 Reusing old log /home/ferxan/Downloads/ferxvis/ferxvis/whatsapp_session/Default/Local Storage/leveldb/000004.log 
+2026/06/29-12:17:20.843 148e4 Delete type=0 #3
