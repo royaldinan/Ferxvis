@@ -59,7 +59,40 @@ def _get_service(account: str = None):
                 flow = InstalledAppFlow.from_client_secrets_file(creds_file, SCOPES)
                 # Saat login, PASTIKAN login dengan akun yang sesuai
                 # ({info['address']}) — Google akan tanya akun mana yang dipakai.
-                creds = flow.run_local_server(port=0)
+                #
+                # PENTING: pakai port FIXED (bukan port=0/random). Port acak
+                # kadang gagal menerima callback redirect dari Google kalau
+                # ada firewall/security software yang membatasi port tinggi
+                # secara default — gejalanya browser sukses login tapi
+                # "localhost:<port> refused to connect" saat redirect balik,
+                # padahal server Python-nya masih hidup.
+                #
+                # Catatan setup: kalau pakai OAuth Client ID tipe "Desktop app"
+                # di Google Cloud Console, redirect URI loopback (127.0.0.1)
+                # otomatis diizinkan dengan port berapa pun — TIDAK perlu
+                # didaftarkan manual. Kalau masih gagal terus, kemungkinan
+                # client ID-nya bukan tipe "Desktop app".
+                try:
+                    creds = flow.run_local_server(
+                        port=8765,
+                        timeout_seconds=90,
+                        open_browser=True,
+                    )
+                except OSError as port_err:
+                    raise RuntimeError(
+                        f"Port 8765 untuk login Google gagal dipakai ({port_err}). "
+                        "Kemungkinan port itu sedang dipakai proses lain. Tutup proses "
+                        "yang memakai port 8765, atau restart Ferxvis, lalu coba lagi."
+                    )
+                except Exception as auth_err:
+                    raise RuntimeError(
+                        f"Login Google gagal/timeout: {auth_err}. "
+                        "Kemungkinan sebab: browser tidak sempat redirect balik ke "
+                        "localhost:8765 dalam 90 detik (klik 'Continue'/'Allow' di "
+                        "Google terlalu lama, atau firewall/antivirus memblokir "
+                        "localhost:8765). Coba lagi dan klik secepat mungkin setelah "
+                        "halaman Google muncul."
+                    )
             with open(token_file, "w") as f:
                 f.write(creds.to_json())
 

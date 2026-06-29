@@ -3,10 +3,30 @@ File tools - akses penuh ke seluruh home directory user.
 """
 
 import os
+import re
 import shutil
 from pathlib import Path
 
 from config import WORKSPACE_DIR, HOME_DIR
+
+# Pola placeholder gaya template yang TIDAK PERNAH boleh masuk ke isi file asli
+# (mis. "{isi_email_terakhir}", "{nama_kontak}") — kalau ini lolos sampai sini,
+# artinya tool/LLM sebelumnya gagal mengambil data asli tapi tetap mencoba
+# menulis seolah-olah berhasil. Mencegah ini lebih murah daripada percaya
+# pada hasil yang sudah ditulis ke disk.
+_PLACEHOLDER_PATTERN = re.compile(r"\{[a-zA-Z_][a-zA-Z0-9_]*\}")
+
+
+def _looks_like_unresolved_placeholder(content: str) -> bool:
+    """True kalau seluruh (atau hampir seluruh) konten cuma placeholder
+    literal yang gak ke-substitusi, bukan isi/teks asli."""
+    if not content:
+        return False
+    stripped = content.strip()
+    # Heuristik: kalau setelah menghapus semua match placeholder, sisa teksnya
+    # sangat pendek/kosong, berarti konten itu memang cuma placeholder polos.
+    without_placeholders = _PLACEHOLDER_PATTERN.sub("", stripped)
+    return bool(_PLACEHOLDER_PATTERN.search(stripped)) and len(without_placeholders) < 5
 
 
 def _resolve_path(relative_path: str) -> Path:
@@ -59,6 +79,13 @@ def create_folder(relative_path: str) -> str:
 
 
 def write_note(relative_path: str, content: str) -> str:
+    if _looks_like_unresolved_placeholder(content):
+        return (
+            f"❌ GAGAL: konten yang akan ditulis ke '{relative_path}' cuma berisi "
+            f"placeholder yang belum ke-isi ('{content.strip()}'), bukan teks asli. "
+            "Tidak ditulis ke file. Kemungkinan langkah sebelumnya (mis. ambil data "
+            "dari email/sumber lain) gagal — cek dan ambil data aslinya dulu."
+        )
     target = _resolve_path(relative_path)
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(content, encoding="utf-8")
@@ -66,6 +93,13 @@ def write_note(relative_path: str, content: str) -> str:
 
 
 def append_note(relative_path: str, content: str) -> str:
+    if _looks_like_unresolved_placeholder(content):
+        return (
+            f"❌ GAGAL: konten yang akan ditambahkan ke '{relative_path}' cuma berisi "
+            f"placeholder yang belum ke-isi ('{content.strip()}'), bukan teks asli. "
+            "Tidak ditambahkan ke file. Kemungkinan langkah sebelumnya gagal — cek dan "
+            "ambil data aslinya dulu."
+        )
     target = _resolve_path(relative_path)
     target.parent.mkdir(parents=True, exist_ok=True)
     with target.open("a", encoding="utf-8") as f:

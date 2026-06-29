@@ -33,24 +33,47 @@ _quota_state = {
     "reset_tokens": None,
     "last_updated": None,        # datetime ISO string
     "model": None,
+    "is_stale": False,           # True kalau data di atas BUKAN dari panggilan terakhir
+                                  # (mis. panggilan terakhir 429 tanpa header lengkap) —
+                                  # GUI harus treat ini beda dari "kuota masih penuh".
 }
 
 
-def _update_quota_from_headers(headers, model: str):
-    """Simpan info rate-limit dari response headers Groq ke state global."""
+def _update_quota_from_headers(headers, model: str, mark_stale_if_missing: bool = False):
+    """Simpan info rate-limit dari response headers Groq ke state global.
+
+    PENTING: kalau header rate-limit tidak lengkap di response ini (sering
+    terjadi pada response 429 — banyak API hanya mengisi header rate-limit
+    lengkap di response sukses), JANGAN diam-diam mempertahankan nilai lama
+    seolah itu masih akurat. Itu yang menyebabkan sidebar menampilkan kuota
+    "penuh" walau panggilan barusan baru saja gagal kena rate limit — nilai
+    yang ditampilkan sebenarnya basi dari panggilan sukses sebelumnya.
+    """
     import datetime as _dt
     try:
         def _to_int(v):
             return int(v) if v is not None and str(v).strip() != "" else None
 
-        _quota_state["limit_requests"] = _to_int(headers.get("x-ratelimit-limit-requests"))
-        _quota_state["remaining_requests"] = _to_int(headers.get("x-ratelimit-remaining-requests"))
+        remaining = _to_int(headers.get("x-ratelimit-remaining-requests"))
+        limit = _to_int(headers.get("x-ratelimit-limit-requests"))
+
+        if remaining is None and limit is None and mark_stale_if_missing:
+            # Response ini (biasanya 429) tidak membawa data rate-limit sama
+            # sekali — tandai data lama sebagai basi alih-alih membiarkan GUI
+            # menampilkannya sebagai kondisi terkini yang valid.
+            _quota_state["is_stale"] = True
+            _quota_state["last_updated"] = _dt.datetime.now().isoformat()
+            return
+
+        _quota_state["limit_requests"] = limit
+        _quota_state["remaining_requests"] = remaining
         _quota_state["reset_requests"] = headers.get("x-ratelimit-reset-requests")
         _quota_state["limit_tokens"] = _to_int(headers.get("x-ratelimit-limit-tokens"))
         _quota_state["remaining_tokens"] = _to_int(headers.get("x-ratelimit-remaining-tokens"))
         _quota_state["reset_tokens"] = headers.get("x-ratelimit-reset-tokens")
         _quota_state["last_updated"] = _dt.datetime.now().isoformat()
         _quota_state["model"] = model
+        _quota_state["is_stale"] = False
     except Exception:
         pass  # quota tracking tidak boleh sampai bikin chat gagal
 
@@ -218,7 +241,10 @@ def _chat_groq(messages: list, tools: list = None, image_data: dict = None,
             timeout=30,
         )
         if not resp.ok:
-            _update_quota_from_headers(resp.headers, model)  # headers tetap ada walau 429
+            # headers tetap dicoba dibaca walau 429, tapi JANGAN diam-diam
+            # pertahankan nilai lama kalau headernya kosong — itu yang bikin
+            # sidebar nampilin "kuota penuh" padahal baru kena rate limit.
+            _update_quota_from_headers(resp.headers, model, mark_stale_if_missing=True)
             try:
                 err_msg = resp.json().get("error", {}).get("message", resp.text)
             except Exception:
@@ -226,10 +252,22 @@ def _chat_groq(messages: list, tools: list = None, image_data: dict = None,
             if resp.status_code == 429:
                 retry_after = resp.headers.get("retry-after", "")
                 reset_req = resp.headers.get("x-ratelimit-reset-requests", "")
-                raise LLMError(
-                    f"Groq API limit harian tercapai (429). "
-                    f"Reset dalam: {reset_req or retry_after or 'tidak diketahui'}."
-                )
+                reset_tok = resp.headers.get("x-ratelimit-reset-tokens", "")
+                # PENTING: header "reset-requests"/"reset-tokens" dari Groq
+                # adalah window rate-limit (sering per MENIT, bukan per HARI).
+                # Sebelumnya kode ini salah melabeli semua 429 sebagai
+                # "limit harian" — itu salah dan bikin angka reset (mis. "1ms")
+                # kelihatan janggal karena memang bukan limit harian yang kena.
+                # Kita tampilkan apa adanya tanpa asumsi jenis limitnya, dan
+                # arahkan ke pesan error asli dari Groq sebagai sumber kebenaran.
+                reset_info = reset_req or reset_tok or retry_after
+                detail = f" Detail dari Groq: {err_msg}" if err_msg else ""
+                if reset_info:
+                    raise LLMError(
+                        f"Groq API rate limit tercapai (429). Coba lagi dalam "
+                        f"~{reset_info}.{detail}"
+                    )
+                raise LLMError(f"Groq API rate limit tercapai (429).{detail}")
             raise LLMError(f"Groq API error {resp.status_code}: {err_msg}")
         result = resp.json()
         _update_quota_from_headers(resp.headers, model)

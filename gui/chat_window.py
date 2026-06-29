@@ -225,10 +225,19 @@ class Sidebar(ctk.CTkFrame):
                 text_color=C_ORANGE
             )
 
-    def set_quota(self, remaining, limit, reset_str=None):
+    def set_quota(self, remaining, limit, reset_str=None, is_stale=False):
         """Update label sisa quota harian Groq. remaining/limit bisa None kalau belum ada data."""
         if remaining is None or limit is None:
             self.quota_label.configure(text="")
+            return
+
+        if is_stale:
+            # Panggilan terakhir gagal (429) tanpa header rate-limit baru —
+            # angka di bawah ini adalah data LAMA dari panggilan sukses
+            # sebelumnya, bukan kondisi saat ini. Tampilkan sebagai tidak
+            # pasti, jangan seolah-olah ini kuota terkini yang masih penuh.
+            text = f"📊 Kuota tidak pasti (terakhir kena rate limit)\n   Data lama: {remaining}/{limit}"
+            self.quota_label.configure(text=text, text_color=C_ORANGE)
             return
 
         pct = (remaining / limit) if limit else 0
@@ -884,6 +893,7 @@ class ChatWindow(ctk.CTk):
                 info.get("remaining_requests"),
                 info.get("limit_requests"),
                 info.get("reset_requests"),
+                info.get("is_stale", False),
             )
         except Exception:
             pass  # quota display tidak boleh sampai bikin chat error

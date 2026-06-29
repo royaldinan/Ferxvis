@@ -12,6 +12,38 @@ from core.memory import load_memory, save_memory
 from tools.registry import TOOL_DEFINITIONS, execute_tool
 
 
+# Prefix yang dipakai tools/*.py untuk menandai hasil gagal (lihat email_tools.py,
+# whatsapp_tools.py, dll — semua mengembalikan string "ERROR ..." / "❌ ..." / "GAGAL ..."
+# alih-alih melempar exception, supaya agent tidak crash). Karena ini cuma STRING biasa,
+# tanpa pengecekan eksplisit LLM bisa lalai menganggap tool tersebut "berhasil" dan lanjut
+# memakai hasilnya sebagai data asli (termasuk placeholder yang gak pernah ke-isi).
+_ERROR_PREFIXES = ("ERROR", "❌", "GAGAL", "⚠️ TIDAK BISA DIPASTIKAN")
+
+
+def _is_error_result(result: str) -> bool:
+    """Deteksi apakah hasil tool menandakan kegagalan, bukan hasil asli."""
+    if not isinstance(result, str):
+        return False
+    stripped = result.strip()
+    return any(stripped.startswith(p) for p in _ERROR_PREFIXES)
+
+
+def _wrap_tool_result_for_history(result: str) -> str:
+    """Kalau hasil tool adalah error, tambahkan instruksi tegas ke LLM supaya
+    tidak melanjutkan seolah-olah data tersedia (mis. menulis placeholder
+    literal ke file lalu mengklaim 'berhasil disalin')."""
+    if _is_error_result(result):
+        return (
+            f"{result}\n\n"
+            "[INSTRUKSI SISTEM: Tool di atas GAGAL — hasilnya bukan data asli, "
+            "jangan dipakai sebagai input untuk tool lain (jangan substitusi ke "
+            "placeholder, jangan tulis ke file, jangan kirim ke kontak lain). "
+            "Beritahu user secara jujur bahwa langkah ini gagal dan sebutkan "
+            "alasannya dari pesan error di atas. JANGAN mengklaim berhasil.]"
+        )
+    return result
+
+
 class PendingConfirmation:
     def __init__(self, tool_name: str, arguments: dict):
         self.tool_name = tool_name
@@ -71,7 +103,7 @@ class FerxvisAgent:
         result = execute_tool(tool_name, arguments)
         if on_tool_call:
             on_tool_call(tool_name, arguments, result)
-        self.history.append({"role": "tool", "content": result})
+        self.history.append({"role": "tool", "content": _wrap_tool_result_for_history(result)})
         return self._continue_loop(on_tool_call=on_tool_call)
 
     def send(self, user_message: str, on_tool_call=None, image_data: dict = None) -> str:
@@ -119,7 +151,7 @@ class FerxvisAgent:
                 result = execute_tool(tool_name, raw_args)
                 if on_tool_call:
                     on_tool_call(tool_name, raw_args, result)
-                self.history.append({"role": "tool", "content": result})
+                self.history.append({"role": "tool", "content": _wrap_tool_result_for_history(result)})
 
         save_memory(self.history)
         return "⚠️ Proses terlalu panjang. Coba pecah permintaan jadi lebih sederhana."
