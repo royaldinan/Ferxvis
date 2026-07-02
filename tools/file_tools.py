@@ -22,35 +22,68 @@ class SandboxViolationError(Exception):
     pass
 
 
-def resolve_safe_path(relative_path: str) -> Path:
+# ── Current directory (di dalam workspace) ──────────────────────────────
+# State in-memory: posisi "folder kerja saat ini" milik Ferxvis, mirip
+# konsep `cd` di terminal. Semua relative_path yang TIDAK diawali "/" akan
+# dihitung relatif terhadap _current_dir, bukan langsung dari WORKSPACE_DIR.
+# _current_dir sendiri selalu berupa path absolut yang sudah divalidasi ada
+# di dalam WORKSPACE_DIR, jadi tidak bisa dipakai untuk kabur dari sandbox.
+_current_dir: Path = Path(WORKSPACE_DIR).resolve()
+
+
+def get_current_dir() -> Path:
+    return _current_dir
+
+
+def get_current_dir_display() -> str:
+    """Current dir relatif terhadap workspace, untuk ditampilkan ke user."""
+    return _display_path(_current_dir)
+
+
+def resolve_safe_path(relative_path: str, base: "Path | None" = None) -> Path:
     """
-    Ubah path yang diminta (relatif terhadap workspace) menjadi path absolut yang aman.
+    Ubah path yang diminta menjadi path absolut yang aman.
     Menolak path yang mencoba keluar dari WORKSPACE_DIR.
+
+    - base: folder acuan untuk path relatif. Default-nya _current_dir
+      (folder kerja Ferxvis saat ini), BUKAN selalu WORKSPACE_DIR.
+      Ini membuat change_directory() benar-benar berefek pada tool-tool lain.
+    - Path yang diawali "/" atau "\\" dianggap absolut TERHADAP WORKSPACE_DIR
+      (bukan terhadap current_dir), supaya user/LLM masih bisa "lompat balik"
+      ke folder utama workspace kapan saja dengan relative_path="/Documents"
+      misalnya, tanpa perlu tahu current_dir sedang di mana.
     """
     relative_path = (relative_path or "").strip()
+    workspace_root = Path(WORKSPACE_DIR).resolve()
+    base = (base or _current_dir).resolve()
 
-    # PENTING: Path absolut (mis. "/etc/passwd" atau "C:\Windows") harus ditolak total,
-    # JANGAN digabung dengan workspace_root, karena pathlib akan menggantikan base path
-    # sepenuhnya kalau bagian kedua adalah path absolut (Path("/a") / "/b" == Path("/b")).
-    # Strip semua leading slash/backslash dan drive letter Windows (mis. "C:") supaya
-    # path selalu diperlakukan sebagai relatif terhadap workspace.
+    is_explicitly_from_workspace_root = relative_path.startswith(("/", "\\"))
+
+    # PENTING: Path absolut gaya OS (mis. "/etc/passwd" atau "C:\Windows") harus
+    # ditolak total, JANGAN digabung begitu saja, karena pathlib akan menggantikan
+    # base path sepenuhnya kalau bagian kedua adalah path absolut
+    # (Path("/a") / "/b" == Path("/b")). Strip semua leading slash/backslash dan
+    # drive letter Windows (mis. "C:") supaya path selalu diperlakukan sebagai
+    # relatif, baik terhadap base maupun workspace_root.
     relative_path = relative_path.strip("/\\")
     if len(relative_path) >= 2 and relative_path[1] == ":":
         # Buang drive letter gaya Windows, contoh "C:\Windows" -> "Windows"
         relative_path = relative_path[2:].strip("/\\")
 
-    workspace_root = Path(WORKSPACE_DIR).resolve()
+    anchor = workspace_root if is_explicitly_from_workspace_root else base
 
-    # Gabungkan dengan workspace root, lalu resolve untuk menormalkan ../ dsb
-    candidate = (workspace_root / relative_path).resolve()
+    # Gabungkan dengan anchor, lalu resolve untuk menormalkan ../ dsb
+    candidate = (anchor / relative_path).resolve()
 
     # Cek: apakah candidate masih di dalam workspace_root?
+    # (Selalu dicek terhadap workspace_root, bukan base, supaya "cd" berulang
+    # ke folder lain tetap tidak bisa mengeluarkan kita dari sandbox.)
     try:
         candidate.relative_to(workspace_root)
     except ValueError:
         raise SandboxViolationError(
             f"Akses ditolak: '{relative_path}' mengarah ke luar workspace yang diizinkan "
-            f"({workspace_root}). Ferxvis hanya boleh bekerja di dalam workspace."
+            f"({workspace_root}). Ferxvis hanya boleh bekerja di dalam folder home ini."
         )
 
     return candidate
@@ -61,6 +94,30 @@ def _display_path(target: Path) -> str:
     workspace_root = Path(WORKSPACE_DIR).resolve()
     rel = target.relative_to(workspace_root)
     return str(rel) if str(rel) != "." else "(folder utama workspace)"
+
+
+def change_directory(relative_path: str = "") -> str:
+    """
+    Pindahkan "folder kerja saat ini" Ferxvis ke subfolder tertentu di dalam
+    workspace (home folder). Semua pemanggilan tool file lain setelah ini
+    (list_files, write_note, move_file, dst dengan relative_path biasa, tanpa
+    diawali "/") akan dihitung relatif terhadap folder baru ini.
+
+    relative_path="" atau "/" akan mengembalikan ke folder utama workspace.
+    """
+    global _current_dir
+    try:
+        target = resolve_safe_path(relative_path, base=_current_dir)
+    except SandboxViolationError as e:
+        return f"ERROR: {e}"
+
+    if not target.exists():
+        return f"ERROR: Folder '{relative_path or '.'}' tidak ditemukan di workspace, current directory tidak berubah."
+    if not target.is_dir():
+        return f"ERROR: '{relative_path}' adalah file, bukan folder. Current directory tidak berubah."
+
+    _current_dir = target
+    return f"Current directory berhasil dipindah ke '{_display_path(target)}'."
 
 
 def list_files(relative_path: str = "") -> str:

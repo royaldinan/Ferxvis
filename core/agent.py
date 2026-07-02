@@ -111,6 +111,14 @@ class FerxvisAgent:
 
     def _continue_loop(self, on_tool_call=None) -> str:
         """Loop inti tool-calling. Dipanggil dari send() maupun resolve_confirmation()."""
+        # Tool result ERROR paling akhir yang belum "dibahas" secara eksplisit oleh
+        # model di jawabannya. Dipakai sebagai jaring pengaman: qwen2.5:7b adalah
+        # model kecil dan kadang mengabaikan instruksi di system prompt soal wajib
+        # melaporkan kegagalan. Kalau model tetap menjawab seolah semua sukses
+        # padahal tool terakhir gagal, kita sisipkan koreksi otomatis di sini,
+        # supaya user tidak dibohongi walau modelnya "lupa" instruksinya sendiri.
+        last_unreported_error: str | None = None
+
         for _ in range(MAX_TOOL_ITERATIONS):
             try:
                 time.sleep(3)  # Hindari rate limit Groq
@@ -123,6 +131,15 @@ class FerxvisAgent:
 
             if not tool_calls:
                 final_text = (message.get("content") or "").strip()
+
+                if last_unreported_error and not self._mentions_failure(final_text):
+                    final_text = (
+                        f"{final_text}\n\n"
+                        f"⚠️ Catatan otomatis: salah satu aksi terakhir sebenarnya GAGAL "
+                        f"({last_unreported_error}), meski jawaban di atas mungkin terdengar "
+                        f"seperti berhasil. Mohon cek ulang sebelum dianggap selesai."
+                    )
+
                 self.history.append({"role": "assistant", "content": final_text})
                 save_memory(self.history)
                 return final_text
@@ -160,6 +177,11 @@ class FerxvisAgent:
                 if on_tool_call:
                     on_tool_call(tool_name, raw_args, result)
 
+                if isinstance(result, str) and result.startswith("ERROR"):
+                    last_unreported_error = result
+                else:
+                    last_unreported_error = None
+
                 tool_call_id = call.get("id") or f"call_{tool_name}"
                 self.history.append({
                     "role": "tool",
@@ -170,4 +192,18 @@ class FerxvisAgent:
         save_memory(self.history)
         return ("⚠️ Maaf, prosesnya jadi terlalu panjang (terlalu banyak langkah berturut-turut). "
                 "Coba pecah permintaanmu jadi beberapa instruksi yang lebih sederhana.")
+
+    @staticmethod
+    def _mentions_failure(text: str) -> bool:
+        """
+        Heuristik sederhana: apakah jawaban model sudah menyinggung kegagalan?
+        Dipakai untuk menghindari duplikasi peringatan kalau model SUDAH benar
+        melaporkan errornya sendiri sesuai instruksi system prompt.
+        """
+        lowered = text.lower()
+        failure_keywords = (
+            "gagal", "error", "tidak berhasil", "tidak bisa", "nggak bisa",
+            "ga bisa", "gabisa", "ditolak", "tidak ditemukan", "maaf",
+        )
+        return any(keyword in lowered for keyword in failure_keywords)
 

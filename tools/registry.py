@@ -13,6 +13,28 @@ TOOL_DEFINITIONS = [
     {
         "type": "function",
         "function": {
+            "name": "change_directory",
+            "description": (
+                "Pindah 'folder kerja saat ini' ke subfolder tertentu di dalam workspace "
+                "(home folder laptop user). Setelah dipanggil, semua tool file lain yang "
+                "memakai relative_path BIASA (tanpa diawali '/') akan bekerja relatif "
+                "terhadap folder baru ini — mirip perintah 'cd' di terminal. "
+                "Gunakan relative_path='' untuk kembali ke folder utama workspace. "
+                "TETAP TIDAK BISA keluar dari home folder user; ini hanya berpindah "
+                "SUBFOLDER di dalamnya, bukan drive atau folder lain di laptop."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "relative_path": {"type": "string", "description": "Subfolder tujuan, relatif terhadap current directory saat ini. Kosongkan untuk kembali ke folder utama workspace."}
+                },
+                "required": []
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "list_files",
             "description": "Lihat daftar file dan folder di dalam suatu folder workspace.",
             "parameters": {
@@ -289,6 +311,7 @@ TOOL_DEFINITIONS = [
 ]
 
 TOOL_FUNCTIONS = {
+    "change_directory": file_tools.change_directory,
     "list_files": file_tools.list_files,
     "create_folder": file_tools.create_folder,
     "write_note": file_tools.write_note,
