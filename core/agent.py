@@ -14,13 +14,38 @@ callback on_confirmation_needed. Eksekusi hanya lanjut kalau user mengonfirmasi 
 """
 
 import json
+import logging
+import os
 import time
 from typing import Optional
 
-from config import SYSTEM_PROMPT, MAX_TOOL_ITERATIONS, TOOLS_REQUIRING_CONFIRMATION
+from config import SYSTEM_PROMPT, MAX_TOOL_ITERATIONS, TOOLS_REQUIRING_CONFIRMATION, BASE_DIR
 from core.llm_client import chat, OllamaError
 from core.memory import load_memory, save_memory
 from tools.registry import TOOL_DEFINITIONS, execute_tool
+
+# ── Logging ───────────────────────────────────────────────────────────
+# Mencatat setiap tool call (nama, argumen, hasil) dan setiap jawaban final
+# model ke file log, supaya kasus "model bilang berhasil padahal tool tidak
+# pernah dipanggil / gagal" bisa ditelusuri persis, bukan sekadar diduga-duga.
+# File log ada di root project, misal: /home/ferxan/Downloads/ferxvis/ferxvis/ferxvis.log
+_LOG_PATH = os.path.join(BASE_DIR, "ferxvis.log")
+logger = logging.getLogger("ferxvis.agent")
+if not logger.handlers:
+    logger.setLevel(logging.DEBUG)
+    _handler = logging.FileHandler(_LOG_PATH, encoding="utf-8", delay=False)
+    _handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+    logger.addHandler(_handler)
+    logger.propagate = False
+
+    # Pastikan setiap baris log langsung ditulis ke disk (bukan menunggu buffer
+    # penuh atau proses berakhir), supaya file log bisa dicek kapan saja saat
+    # aplikasi masih berjalan, termasuk untuk debugging langsung oleh user.
+    _orig_emit = _handler.emit
+    def _emit_and_flush(record):
+        _orig_emit(record)
+        _handler.flush()
+    _handler.emit = _emit_and_flush
 
 
 class PendingConfirmation:
@@ -124,6 +149,7 @@ class FerxvisAgent:
                 time.sleep(3)  # Hindari rate limit Groq
                 response = chat(self.history, tools=TOOL_DEFINITIONS)
             except OllamaError as e:
+                logger.error(f"OllamaError: {e}")
                 return f"⚠️ {e}"
 
             message = response.get("message", {})
@@ -131,6 +157,41 @@ class FerxvisAgent:
 
             if not tool_calls:
                 final_text = (message.get("content") or "").strip()
+                # PENTING untuk debugging: log kasus di mana model TIDAK memanggil
+                # tool sama sekali, tapi jawabannya "terdengar" seperti melakukan
+                # sesuatu (mengandung kata kerja aksi). Ini menangkap persis kasus
+                # "model berimajinasi sudah memanggil tool padahal tidak pernah".
+                sounds_like_action = any(
+                    kw in final_text.lower()
+                    for kw in ("berhasil", "telah dibuat", "sudah dibuat", "telah dipindah", "telah dihapus")
+                )
+                if sounds_like_action:
+                    last_user_msg = next(
+                        (m.get("content", "") for m in reversed(self.history) if m.get("role") == "user"),
+                        "?",
+                    )
+                    logger.warning(
+                        f"MODEL MENGKLAIM AKSI TANPA TOOL CALL. "
+                        f"User message terakhir: {last_user_msg[:200]!r}. "
+                        f"Jawaban model: {final_text[:300]!r}"
+                    )
+                    # Ini kasus PALING berbahaya untuk user: model menulis kalimat
+                    # seperti "telah dibuat" / "berhasil dipindah" padahal TIDAK
+                    # PERNAH memanggil tool sama sekali (jadi tidak ada eksekusi
+                    # nyata apapun di filesystem). Diam-diam mencatat ke log saja
+                    # tidak cukup karena user tidak akan pernah membaca file log
+                    # itu di tengah percakapan biasa. Peringatan ini WAJIB tampil
+                    # di chat, bukan cuma di file log.
+                    final_text = (
+                        f"{final_text}\n\n"
+                        f"⚠️ Catatan otomatis: jawaban di atas TIDAK disertai eksekusi tool apapun "
+                        f"(tidak ada perintah yang benar-benar dijalankan ke file/folder). Kemungkinan "
+                        f"besar aksi ini BELUM benar-benar terjadi, meski kalimatnya terdengar seperti "
+                        f"sudah selesai. Coba minta lagi dengan kalimat yang lebih spesifik, atau cek "
+                        f"langsung pakai 'lihat isi folder Documents' untuk memastikan."
+                    )
+                else:
+                    logger.info(f"Jawaban final tanpa tool call: {final_text[:200]!r}")
 
                 if last_unreported_error and not self._mentions_failure(final_text):
                     final_text = (
@@ -168,11 +229,13 @@ class FerxvisAgent:
 
                 if tool_name in TOOLS_REQUIRING_CONFIRMATION:
                     # Tahan eksekusi, minta konfirmasi user dulu.
+                    logger.info(f"TOOL CALL (menunggu konfirmasi): {tool_name}({raw_args})")
                     self._pending_confirmation = PendingConfirmation(tool_name, raw_args)
                     save_memory(self.history)
                     return self.confirmation_prompt_text()
 
                 result = execute_tool(tool_name, raw_args)
+                logger.info(f"TOOL CALL: {tool_name}({raw_args}) -> {result[:300] if isinstance(result, str) else result!r}")
 
                 if on_tool_call:
                     on_tool_call(tool_name, raw_args, result)

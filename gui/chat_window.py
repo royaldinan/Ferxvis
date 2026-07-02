@@ -7,6 +7,7 @@ Kompatibel dengan repo asli royaldinan/Ferxvis
 import threading
 import json
 import os
+import io
 import base64
 import datetime
 from pathlib import Path
@@ -14,6 +15,12 @@ from pathlib import Path
 import customtkinter as ctk
 import tkinter as tk
 from tkinter import filedialog, messagebox
+
+try:
+    from PIL import ImageGrab, Image
+    _PIL_AVAILABLE = True
+except ImportError:
+    _PIL_AVAILABLE = False
 
 from core.agent import FerxvisAgent
 from core.llm_client import check_ollama_running, check_model_available
@@ -284,6 +291,19 @@ class ClipboardPanel(ctk.CTkToplevel):
 
 
 # ── Bubble Widget ─────────────────────────────────────────────
+def _estimate_wrapped_lines(text: str, wrap_chars: int = 78) -> int:
+    """
+    Perkiraan jumlah baris setelah word-wrap, untuk menentukan tinggi CTkTextbox.
+    Tidak perlu presisi sempurna (textbox tetap bisa di-scroll kalau meleset),
+    cukup dekat supaya bubble tidak terlalu pendek (teks terpotong) atau
+    terlalu tinggi (banyak area kosong di bawah).
+    """
+    total = 0
+    for line in (text or "").split("\n"):
+        total += max(1, -(-len(line) // wrap_chars))  # ceil division
+    return max(1, total)
+
+
 class Bubble(ctk.CTkFrame):
     def __init__(self, parent, role, text, **kw):
         super().__init__(parent, fg_color="transparent", **kw)
@@ -295,11 +315,49 @@ class Bubble(ctk.CTkFrame):
         label_text = f"{icon}  {text}" if icon else text
         container = ctk.CTkFrame(self, fg_color="transparent")
         container.pack(fill="x", pady=2)
-        ctk.CTkLabel(
-            container, text=label_text, justify="left",
-            wraplength=600, fg_color=bg, corner_radius=12,
-            padx=14, pady=10, font=ctk.CTkFont(size=13), text_color=TEXT,
-        ).pack(anchor=anchor, padx=12)
+
+        n_lines = _estimate_wrapped_lines(label_text)
+        line_height_px = 20  # kira-kira, mengikuti font size=13 + padding baris
+        height = min(max(n_lines * line_height_px + 20, 40), 500)  # clamp, textbox bisa di-scroll kalau lebih panjang
+
+        # CTkTextbox dipakai (bukan CTkLabel) supaya teks bisa di-select dan
+        # di-copy oleh user — CTkLabel murni display, tidak punya text
+        # selection sama sekali. state="normal" tetap dipakai (bukan
+        # "disabled") supaya selection & Ctrl+C jalan normal di Tk;
+        # pengeditan dicegah lewat binding key/paste di bawah, bukan lewat
+        # men-disable widget-nya.
+        self.textbox = ctk.CTkTextbox(
+            container, wrap="word", fg_color=bg, corner_radius=12,
+            border_width=0, padx=14, pady=10,
+            font=ctk.CTkFont(size=13), text_color=TEXT,
+            height=height, activate_scrollbars=False,
+        )
+        self.textbox.insert("1.0", label_text)
+        self._make_readonly(self.textbox)
+        self.textbox.pack(anchor=anchor, padx=12, fill="x" if False else "none")
+
+        # Lebar mengikuti proporsi window, meniru wraplength=600 versi lama.
+        self.textbox.configure(width=min(620, max(200, int(len(max(label_text.split(chr(10)), key=len, default="")) * 7.2))))
+
+    @staticmethod
+    def _make_readonly(textbox: ctk.CTkTextbox):
+        """
+        Cegah user mengetik/menghapus isi bubble, TANPA mematikan
+        kemampuan select & copy (yang akan hilang kalau pakai
+        state="disabled" di beberapa versi CTkTextbox/Tk).
+        """
+        def _block_edit(event):
+            # Izinkan kombinasi copy & select-all, blok semua input lain
+            # yang bisa mengubah isi (ketik huruf, Delete, Backspace, paste, dst).
+            ctrl = (event.state & 0x4) != 0  # bitmask Control di X11/Tk
+            if ctrl and event.keysym.lower() in ("c", "a"):
+                return None  # biarkan lewat (copy / select-all)
+            return "break"  # blok semua tombol lain
+
+        textbox.bind("<Key>", _block_edit)
+        textbox.bind("<<Paste>>", lambda e: "break")
+        textbox.bind("<Control-a>", lambda e: (textbox._textbox.tag_add("sel", "1.0", "end"), "break"))
+        textbox.bind("<Control-A>", lambda e: (textbox._textbox.tag_add("sel", "1.0", "end"), "break"))
 
 
 # ── Main Window ───────────────────────────────────────────────
@@ -397,6 +455,23 @@ class ChatWindow(ctk.CTk):
             corner_radius=10, font=ctk.CTkFont(size=13), text_color=TEXT)
         self.input_box.pack(side="left", fill="x", expand=True, padx=(0, 10))
         self.input_box.bind("<Return>", self._on_enter)
+        # Ctrl+A default Tk BUKAN select-all (di beberapa binding malah loncat
+        # ke awal baris, gaya Emacs). Override eksplisit di sini supaya Ctrl+A
+        # benar-benar memilih semua teks yang sedang diketik.
+        self.input_box.bind(
+            "<Control-a>",
+            lambda e: (self.input_box._textbox.tag_add("sel", "1.0", "end"), "break")
+        )
+        self.input_box.bind(
+            "<Control-A>",
+            lambda e: (self.input_box._textbox.tag_add("sel", "1.0", "end"), "break")
+        )
+        # Ctrl+V: kalau isi clipboard gambar, pasang sebagai pending image
+        # (sama seperti klik tombol "Kirim Gambar"). Kalau isi clipboard
+        # teks biasa, _paste_image_from_clipboard mengembalikan None supaya
+        # event diteruskan ke binding paste teks bawaan CTkTextbox.
+        self.input_box.bind("<Control-v>", self._paste_image_from_clipboard)
+        self.input_box.bind("<Control-V>", self._paste_image_from_clipboard)
         self.send_btn = ctk.CTkButton(
             inrow, text="Kirim ➤", width=90, height=50,
             fg_color=ACCENT, hover_color="#2d75d4",
@@ -570,18 +645,95 @@ class ChatWindow(ctk.CTk):
             ext = Path(fp).suffix.lower()
             mt = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png",
                   ".gif": "image/gif", ".webp": "image/webp"}.get(ext, "image/jpeg")
-            self._pending_image = {"base64": b64, "media_type": mt}
-            for w in self.img_bar.winfo_children():
-                w.destroy()
-            ctk.CTkLabel(self.img_bar, text=f"🖼️ {Path(fp).name}",
-                         font=ctk.CTkFont(size=12), text_color=TEXT).pack(side="left", padx=16)
-            ctk.CTkButton(self.img_bar, text="✕", width=28, height=28,
-                          fg_color="transparent", hover_color=BORDER, text_color=MUTED,
-                          command=lambda: (self.img_bar.pack_forget(), setattr(self, "_pending_image", None))
-                          ).pack(side="right", padx=8)
-            self.img_bar.pack(fill="x", before=self.chat_area)
+            self._set_pending_image(b64, mt, label=Path(fp).name)
         except Exception as e:
             messagebox.showerror("Error", f"Gagal buka gambar: {e}")
+
+    def _set_pending_image(self, b64: str, media_type: str, label: str):
+        """
+        Set gambar yang akan dikirim di pesan berikutnya, dan tampilkan preview
+        bar-nya. Dipanggil dari dua jalur: _attach_image (pilih file lewat
+        dialog OS) dan _paste_image_from_clipboard (Ctrl+V) — keduanya
+        berakhir di jalur yang sama persis, supaya gambar dari clipboard
+        diperlakukan identik dengan gambar dari file.
+        """
+        self._pending_image = {"base64": b64, "media_type": media_type}
+        for w in self.img_bar.winfo_children():
+            w.destroy()
+        ctk.CTkLabel(self.img_bar, text=f"🖼️ {label}",
+                     font=ctk.CTkFont(size=12), text_color=TEXT).pack(side="left", padx=16)
+        ctk.CTkButton(self.img_bar, text="✕", width=28, height=28,
+                      fg_color="transparent", hover_color=BORDER, text_color=MUTED,
+                      command=lambda: (self.img_bar.pack_forget(), setattr(self, "_pending_image", None))
+                      ).pack(side="right", padx=8)
+        self.img_bar.pack(fill="x", before=self.chat_area)
+
+    def _paste_image_from_clipboard(self, event=None):
+        """
+        Tangani Ctrl+V: kalau isi clipboard adalah GAMBAR (bukan teks),
+        pasang sebagai pending image (jalur sama dengan tombol "Kirim Gambar").
+        Kalau isi clipboard teks biasa, biarkan lewat ke perilaku paste teks
+        normal di textbox (return None, JANGAN "break").
+        """
+        if not _PIL_AVAILABLE:
+            messagebox.showerror(
+                "Fitur belum aktif",
+                "Paste gambar butuh library Pillow. Jalankan:\n\npip install Pillow\n\n"
+                "lalu restart Ferxvis."
+            )
+            return "break"
+
+        try:
+            clip = ImageGrab.grabclipboard()
+        except Exception as e:
+            # Di Linux, ImageGrab.grabclipboard() butuh xclip atau wl-clipboard
+            # terpasang di OS (bukan cuma pip package). Kalau tidak ada,
+            # Pillow melempar exception yang membingungkan kalau tidak
+            # dijelaskan ulang di sini.
+            messagebox.showerror(
+                "Gagal membaca clipboard",
+                f"Tidak bisa membaca gambar dari clipboard.\n\n"
+                f"Di Linux, ini butuh 'xclip' (X11) atau 'wl-clipboard' (Wayland) "
+                f"terpasang di sistem. Coba jalankan salah satu:\n\n"
+                f"  sudo dnf install xclip\n"
+                f"  sudo dnf install wl-clipboard\n\n"
+                f"Detail error: {e}"
+            )
+            return "break"
+
+        if clip is None:
+            # Clipboard kosong ATAU isinya teks biasa (grabclipboard hanya
+            # menangkap gambar/file, bukan teks). Biarkan event lanjut ke
+            # binding paste teks normal milik CTkTextbox.
+            return None
+
+        # grabclipboard() bisa mengembalikan objek PIL.Image langsung
+        # (screenshot / copy dari image viewer), ATAU list path file
+        # (kalau user copy file gambar dari file manager).
+        try:
+            if isinstance(clip, list) and clip:
+                fp = clip[0]
+                with open(fp, "rb") as f:
+                    raw = f.read()
+                b64 = base64.b64encode(raw).decode("utf-8")
+                ext = Path(fp).suffix.lower()
+                mt = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png",
+                      ".gif": "image/gif", ".webp": "image/webp"}.get(ext, "image/jpeg")
+                self._set_pending_image(b64, mt, label=Path(fp).name)
+            elif isinstance(clip, Image.Image):
+                buf = io.BytesIO()
+                # Clipboard image biasanya tidak punya nama file / format asli
+                # yang jelas (misal hasil screenshot); simpan sebagai PNG,
+                # format lossless yang aman untuk segala jenis gambar.
+                clip.save(buf, format="PNG")
+                b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+                self._set_pending_image(b64, "image/png", label="(gambar dari clipboard)")
+            else:
+                return None  # bukan gambar, biarkan lewat sebagai paste teks biasa
+        except Exception as e:
+            messagebox.showerror("Error", f"Gagal memproses gambar dari clipboard: {e}")
+
+        return "break"
 
     def _voice_input(self):
         self.send_btn.configure(text="🔴...", state="disabled")
