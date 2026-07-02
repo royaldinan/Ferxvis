@@ -1,0 +1,315 @@
+From e64f8c5aad16872b930b3af9130d4d53dd890aee Mon Sep 17 00:00:00 2001
+From: Ferxvis Dev <ferxvis@local>
+Date: Thu, 2 Jul 2026 07:36:18 +0000
+Subject: [PATCH] Fix: agent bisa ganti current directory + tidak bohong soal
+ status gagal
+
+Root cause bug 'bilang berhasil tapi gaada yang kejadian':
+1. Tidak ada tool untuk pindah folder kerja (cuma bisa akses relatif ke
+   satu WORKSPACE_DIR tetap, tidak ada konsep 'current directory').
+2. Waktu tool gagal (return 'ERROR: ...'), model tetap menjawab
+   seolah berhasil karena system prompt tidak melarang itu secara
+   eksplisit.
+
+Perubahan:
+- tools/file_tools.py: tambah change_directory() + _current_dir
+  in-memory state. resolve_safe_path() sekarang menerima parameter
+  base sehingga semua tool lain otomatis mengikuti current directory.
+  Sandbox ke WORKSPACE_DIR (home folder) tetap dipertahankan penuh,
+  tidak dibuka ke drive/folder lain di laptop.
+- tools/registry.py: daftarkan tool change_directory baru.
+- config.py: system prompt sekarang punya aturan eksplisit soal
+  change_directory dan larangan keras mengklaim 'berhasil' saat hasil
+  tool adalah ERROR.
+- core/agent.py: jaring pengaman otomatis di _continue_loop() - kalau
+  tool call terakhir ERROR tapi jawaban final model tidak menyebut
+  kegagalan sama sekali, sistem otomatis menyisipkan koreksi ke user.
+  Ini penting karena model kecil (qwen2.5:7b) bisa saja tetap
+  mengabaikan instruksi di system prompt.
+
+Sudah ditest: cd normal ke subfolder, percobaan keluar sandbox lewat
+../../.. dan absolute path Windows-style (ditolak), cd ke folder yang
+tidak ada, dan simulasi skenario asli (model klaim berhasil padahal
+tool result ERROR -> sekarang otomatis dikoreksi).
+---
+ config.py           | 39 ++++++++++++++++++----
+ core/agent.py       | 36 +++++++++++++++++++++
+ tools/file_tools.py | 79 ++++++++++++++++++++++++++++++++++++++-------
+ tools/registry.py   | 23 +++++++++++++
+ 4 files changed, 159 insertions(+), 18 deletions(-)
+
+diff --git a/config.py b/config.py
+index d153ef4..fb100e1 100644
+--- a/config.py
++++ b/config.py
+@@ -57,14 +57,39 @@ ATURAN PENTING SOAL WORKSPACE:
+    - destination_relative_path (path tujuan, relatif terhadap workspace)
+ 5. Saat memanggil write_note atau append_note, "relative_path" WAJIB berupa path ke sebuah
+    FILE (contoh: "catatan.txt" atau "Dokumen/catatan.txt"), BUKAN folder kosong "".
++6. Kalau user minta "pindah/ubah/masuk ke folder/directory X" (tanpa minta membuat atau
++   menghapus apapun), itu artinya panggil tool change_directory(relative_path="X"), BUKAN
++   create_folder. Setelah change_directory berhasil, semua path relatif berikutnya (di
++   list_files, write_note, move_file, dst.) otomatis dihitung dari folder baru itu.
++7. Ferxvis TIDAK BISA pindah ke drive atau folder lain di laptop yang berada di LUAR home
++   folder user (misal drive D:, atau folder di luar home). Kalau user minta itu, JELASKAN
++   keterbatasan ini secara jujur (lihat ATURAN KEJUJURAN di bawah), jangan berpura-pura
++   berhasil dan jangan mencoba path aneh berulang kali.
++
++ATURAN KEJUJURAN TENTANG HASIL TOOL (PALING PENTING):
++8. Setiap kali kamu memanggil tool, hasilnya akan muncul sebagai pesan role "tool" di
++   history. Periksa isinya SEBELUM menyimpulkan apapun ke user:
++   - Kalau isinya diawali "ERROR" atau "ERROR:", tool itu GAGAL dieksekusi. Kamu WAJIB
++     memberi tahu user bahwa aksinya GAGAL, dan sertakan alasan gagalnya (ambil dari isi
++     pesan error tersebut, jangan disingkat sampai hilang maknanya).
++   - JANGAN PERNAH mengatakan "berhasil", "sukses", "sudah dilakukan", atau kalimat sejenis
++     untuk sebuah aksi kalau hasil tool-nya adalah ERROR. Ini berlaku walau kamu sudah
++     mencoba beberapa kali dan capek — tetap laporkan apa adanya.
++   - Kalau kamu memanggil tool yang sama 2x berturut-turut dan masih ERROR, JANGAN coba
++     lagi ketiga kalinya dengan menebak-nebak path baru. Berhenti, lalu jelaskan ke user
++     persis apa yang gagal dan tanyakan path/nama folder yang benar.
++   - Kalau ragu apakah suatu aksi benar-benar berhasil, JANGAN menebak ke arah "berhasil".
++     Lebih baik bilang tidak yakin dan sarankan user mengecek sendiri (misal lewat
++     list_files), daripada mengklaim sukses yang belum tentu benar.
+ 
+ ATURAN UMUM:
+-6. Kamu HANYA boleh mengakses file/folder di dalam workspace yang diizinkan.
+-7. Selalu konfirmasi singkat ke user setelah melakukan aksi.
+-8. Kalau instruksi user ambigu, buat asumsi yang wajar dan sebutkan ke user.
+-9. Jawab dalam Bahasa Indonesia, gaya santai tapi jelas.
+-10. Kalau user hanya mengajak ngobrol biasa, jawab langsung tanpa memanggil tool.
+-11. Untuk pertanyaan yang butuh info terkini, gunakan tool search_web.
+-12. Untuk aksi sensitif (email, WhatsApp, hapus file), sistem otomatis minta konfirmasi —
++9. Kamu HANYA boleh mengakses file/folder di dalam workspace (home folder) yang diizinkan.
++10. Selalu konfirmasi singkat ke user setelah melakukan aksi, dan konfirmasi itu harus
++    sesuai dengan isi hasil tool yang sebenarnya (lihat ATURAN KEJUJURAN di atas).
++11. Kalau instruksi user ambigu, buat asumsi yang wajar dan sebutkan ke user.
++12. Jawab dalam Bahasa Indonesia, gaya santai tapi jelas.
++13. Kalau user hanya mengajak ngobrol biasa, jawab langsung tanpa memanggil tool.
++14. Untuk pertanyaan yang butuh info terkini, gunakan tool search_web.
++15. Untuk aksi sensitif (email, WhatsApp, hapus file), sistem otomatis minta konfirmasi —
+     kamu tidak perlu menanyakan ulang, cukup panggil tool-nya.
+ """
+diff --git a/core/agent.py b/core/agent.py
+index bb64263..76aec4c 100644
+--- a/core/agent.py
++++ b/core/agent.py
+@@ -111,6 +111,14 @@ class FerxvisAgent:
+ 
+     def _continue_loop(self, on_tool_call=None) -> str:
+         """Loop inti tool-calling. Dipanggil dari send() maupun resolve_confirmation()."""
++        # Tool result ERROR paling akhir yang belum "dibahas" secara eksplisit oleh
++        # model di jawabannya. Dipakai sebagai jaring pengaman: qwen2.5:7b adalah
++        # model kecil dan kadang mengabaikan instruksi di system prompt soal wajib
++        # melaporkan kegagalan. Kalau model tetap menjawab seolah semua sukses
++        # padahal tool terakhir gagal, kita sisipkan koreksi otomatis di sini,
++        # supaya user tidak dibohongi walau modelnya "lupa" instruksinya sendiri.
++        last_unreported_error: str | None = None
++
+         for _ in range(MAX_TOOL_ITERATIONS):
+             try:
+                 time.sleep(3)  # Hindari rate limit Groq
+@@ -123,6 +131,15 @@ class FerxvisAgent:
+ 
+             if not tool_calls:
+                 final_text = (message.get("content") or "").strip()
++
++                if last_unreported_error and not self._mentions_failure(final_text):
++                    final_text = (
++                        f"{final_text}\n\n"
++                        f"⚠️ Catatan otomatis: salah satu aksi terakhir sebenarnya GAGAL "
++                        f"({last_unreported_error}), meski jawaban di atas mungkin terdengar "
++                        f"seperti berhasil. Mohon cek ulang sebelum dianggap selesai."
++                    )
++
+                 self.history.append({"role": "assistant", "content": final_text})
+                 save_memory(self.history)
+                 return final_text
+@@ -160,6 +177,11 @@ class FerxvisAgent:
+                 if on_tool_call:
+                     on_tool_call(tool_name, raw_args, result)
+ 
++                if isinstance(result, str) and result.startswith("ERROR"):
++                    last_unreported_error = result
++                else:
++                    last_unreported_error = None
++
+                 tool_call_id = call.get("id") or f"call_{tool_name}"
+                 self.history.append({
+                     "role": "tool",
+@@ -171,3 +193,17 @@ class FerxvisAgent:
+         return ("⚠️ Maaf, prosesnya jadi terlalu panjang (terlalu banyak langkah berturut-turut). "
+                 "Coba pecah permintaanmu jadi beberapa instruksi yang lebih sederhana.")
+ 
++    @staticmethod
++    def _mentions_failure(text: str) -> bool:
++        """
++        Heuristik sederhana: apakah jawaban model sudah menyinggung kegagalan?
++        Dipakai untuk menghindari duplikasi peringatan kalau model SUDAH benar
++        melaporkan errornya sendiri sesuai instruksi system prompt.
++        """
++        lowered = text.lower()
++        failure_keywords = (
++            "gagal", "error", "tidak berhasil", "tidak bisa", "nggak bisa",
++            "ga bisa", "gabisa", "ditolak", "tidak ditemukan", "maaf",
++        )
++        return any(keyword in lowered for keyword in failure_keywords)
++
+diff --git a/tools/file_tools.py b/tools/file_tools.py
+index a5e1657..268cd6c 100644
+--- a/tools/file_tools.py
++++ b/tools/file_tools.py
+@@ -22,35 +22,68 @@ class SandboxViolationError(Exception):
+     pass
+ 
+ 
+-def resolve_safe_path(relative_path: str) -> Path:
++# ── Current directory (di dalam workspace) ──────────────────────────────
++# State in-memory: posisi "folder kerja saat ini" milik Ferxvis, mirip
++# konsep `cd` di terminal. Semua relative_path yang TIDAK diawali "/" akan
++# dihitung relatif terhadap _current_dir, bukan langsung dari WORKSPACE_DIR.
++# _current_dir sendiri selalu berupa path absolut yang sudah divalidasi ada
++# di dalam WORKSPACE_DIR, jadi tidak bisa dipakai untuk kabur dari sandbox.
++_current_dir: Path = Path(WORKSPACE_DIR).resolve()
++
++
++def get_current_dir() -> Path:
++    return _current_dir
++
++
++def get_current_dir_display() -> str:
++    """Current dir relatif terhadap workspace, untuk ditampilkan ke user."""
++    return _display_path(_current_dir)
++
++
++def resolve_safe_path(relative_path: str, base: "Path | None" = None) -> Path:
+     """
+-    Ubah path yang diminta (relatif terhadap workspace) menjadi path absolut yang aman.
++    Ubah path yang diminta menjadi path absolut yang aman.
+     Menolak path yang mencoba keluar dari WORKSPACE_DIR.
++
++    - base: folder acuan untuk path relatif. Default-nya _current_dir
++      (folder kerja Ferxvis saat ini), BUKAN selalu WORKSPACE_DIR.
++      Ini membuat change_directory() benar-benar berefek pada tool-tool lain.
++    - Path yang diawali "/" atau "\\" dianggap absolut TERHADAP WORKSPACE_DIR
++      (bukan terhadap current_dir), supaya user/LLM masih bisa "lompat balik"
++      ke folder utama workspace kapan saja dengan relative_path="/Documents"
++      misalnya, tanpa perlu tahu current_dir sedang di mana.
+     """
+     relative_path = (relative_path or "").strip()
++    workspace_root = Path(WORKSPACE_DIR).resolve()
++    base = (base or _current_dir).resolve()
++
++    is_explicitly_from_workspace_root = relative_path.startswith(("/", "\\"))
+ 
+-    # PENTING: Path absolut (mis. "/etc/passwd" atau "C:\Windows") harus ditolak total,
+-    # JANGAN digabung dengan workspace_root, karena pathlib akan menggantikan base path
+-    # sepenuhnya kalau bagian kedua adalah path absolut (Path("/a") / "/b" == Path("/b")).
+-    # Strip semua leading slash/backslash dan drive letter Windows (mis. "C:") supaya
+-    # path selalu diperlakukan sebagai relatif terhadap workspace.
++    # PENTING: Path absolut gaya OS (mis. "/etc/passwd" atau "C:\Windows") harus
++    # ditolak total, JANGAN digabung begitu saja, karena pathlib akan menggantikan
++    # base path sepenuhnya kalau bagian kedua adalah path absolut
++    # (Path("/a") / "/b" == Path("/b")). Strip semua leading slash/backslash dan
++    # drive letter Windows (mis. "C:") supaya path selalu diperlakukan sebagai
++    # relatif, baik terhadap base maupun workspace_root.
+     relative_path = relative_path.strip("/\\")
+     if len(relative_path) >= 2 and relative_path[1] == ":":
+         # Buang drive letter gaya Windows, contoh "C:\Windows" -> "Windows"
+         relative_path = relative_path[2:].strip("/\\")
+ 
+-    workspace_root = Path(WORKSPACE_DIR).resolve()
++    anchor = workspace_root if is_explicitly_from_workspace_root else base
+ 
+-    # Gabungkan dengan workspace root, lalu resolve untuk menormalkan ../ dsb
+-    candidate = (workspace_root / relative_path).resolve()
++    # Gabungkan dengan anchor, lalu resolve untuk menormalkan ../ dsb
++    candidate = (anchor / relative_path).resolve()
+ 
+     # Cek: apakah candidate masih di dalam workspace_root?
++    # (Selalu dicek terhadap workspace_root, bukan base, supaya "cd" berulang
++    # ke folder lain tetap tidak bisa mengeluarkan kita dari sandbox.)
+     try:
+         candidate.relative_to(workspace_root)
+     except ValueError:
+         raise SandboxViolationError(
+             f"Akses ditolak: '{relative_path}' mengarah ke luar workspace yang diizinkan "
+-            f"({workspace_root}). Ferxvis hanya boleh bekerja di dalam workspace."
++            f"({workspace_root}). Ferxvis hanya boleh bekerja di dalam folder home ini."
+         )
+ 
+     return candidate
+@@ -63,6 +96,30 @@ def _display_path(target: Path) -> str:
+     return str(rel) if str(rel) != "." else "(folder utama workspace)"
+ 
+ 
++def change_directory(relative_path: str = "") -> str:
++    """
++    Pindahkan "folder kerja saat ini" Ferxvis ke subfolder tertentu di dalam
++    workspace (home folder). Semua pemanggilan tool file lain setelah ini
++    (list_files, write_note, move_file, dst dengan relative_path biasa, tanpa
++    diawali "/") akan dihitung relatif terhadap folder baru ini.
++
++    relative_path="" atau "/" akan mengembalikan ke folder utama workspace.
++    """
++    global _current_dir
++    try:
++        target = resolve_safe_path(relative_path, base=_current_dir)
++    except SandboxViolationError as e:
++        return f"ERROR: {e}"
++
++    if not target.exists():
++        return f"ERROR: Folder '{relative_path or '.'}' tidak ditemukan di workspace, current directory tidak berubah."
++    if not target.is_dir():
++        return f"ERROR: '{relative_path}' adalah file, bukan folder. Current directory tidak berubah."
++
++    _current_dir = target
++    return f"Current directory berhasil dipindah ke '{_display_path(target)}'."
++
++
+ def list_files(relative_path: str = "") -> str:
+     """List semua file & folder di dalam path (relatif terhadap workspace)."""
+     try:
+diff --git a/tools/registry.py b/tools/registry.py
+index ce75ffe..9f6a84c 100644
+--- a/tools/registry.py
++++ b/tools/registry.py
+@@ -10,6 +10,28 @@ from tools import whatsapp_tools
+ from tools import telegram_tools
+ 
+ TOOL_DEFINITIONS = [
++    {
++        "type": "function",
++        "function": {
++            "name": "change_directory",
++            "description": (
++                "Pindah 'folder kerja saat ini' ke subfolder tertentu di dalam workspace "
++                "(home folder laptop user). Setelah dipanggil, semua tool file lain yang "
++                "memakai relative_path BIASA (tanpa diawali '/') akan bekerja relatif "
++                "terhadap folder baru ini — mirip perintah 'cd' di terminal. "
++                "Gunakan relative_path='' untuk kembali ke folder utama workspace. "
++                "TETAP TIDAK BISA keluar dari home folder user; ini hanya berpindah "
++                "SUBFOLDER di dalamnya, bukan drive atau folder lain di laptop."
++            ),
++            "parameters": {
++                "type": "object",
++                "properties": {
++                    "relative_path": {"type": "string", "description": "Subfolder tujuan, relatif terhadap current directory saat ini. Kosongkan untuk kembali ke folder utama workspace."}
++                },
++                "required": []
++            }
++        }
++    },
+     {
+         "type": "function",
+         "function": {
+@@ -289,6 +311,7 @@ TOOL_DEFINITIONS = [
+ ]
+ 
+ TOOL_FUNCTIONS = {
++    "change_directory": file_tools.change_directory,
+     "list_files": file_tools.list_files,
+     "create_folder": file_tools.create_folder,
+     "write_note": file_tools.write_note,
+-- 
+2.43.0
+

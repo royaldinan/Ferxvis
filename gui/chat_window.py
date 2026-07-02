@@ -17,10 +17,19 @@ import tkinter as tk
 from tkinter import filedialog, messagebox
 
 try:
-    from PIL import ImageGrab, Image
+    from PIL import ImageGrab, Image, ImageOps
     _PIL_AVAILABLE = True
 except ImportError:
     _PIL_AVAILABLE = False
+
+try:
+    from tkinterdnd2 import DND_FILES
+    _DND_AVAILABLE = True
+except ImportError:
+    # Drag & drop nonaktif kalau tkinterdnd2 belum terpasang (lihat
+    # requirements.txt). App tetap jalan normal tanpanya — user masih
+    # bisa pakai tombol "Kirim Gambar" atau Ctrl+V.
+    _DND_AVAILABLE = False
 
 from core.agent import FerxvisAgent
 from core.llm_client import check_ollama_running, check_model_available
@@ -361,7 +370,29 @@ class Bubble(ctk.CTkFrame):
 
 
 # ── Main Window ───────────────────────────────────────────────
-class ChatWindow(ctk.CTk):
+# TkinterDnD.Tk() dibutuhkan sebagai root window supaya OS mengenali drag&drop
+# file dari file manager. Kalau tkinterdnd2 tidak terpasang, ChatWindow jatuh
+# balik jadi ctk.CTk murni (perilaku persis seperti sebelum fitur ini ada) --
+# drop_target_register di _build() sudah dibungkus try/except untuk kasus ini.
+if _DND_AVAILABLE:
+    from tkinterdnd2 import TkinterDnD
+
+    class _DnDCTk(TkinterDnD.Tk, ctk.CTk):
+        """customtkinter tidak resmi mendukung TkinterDnD, tapi menggabungkan
+        keduanya lewat multiple inheritance seperti ini adalah pola yang umum
+        dipakai komunitas customtkinter untuk kasus ini -- TkinterDnD.Tk
+        menambahkan kapabilitas drag&drop di level Tcl/Tk, sementara ctk.CTk
+        tetap menangani semua styling & widget CTk seperti biasa."""
+        def __init__(self, *args, **kwargs):
+            TkinterDnD.Tk.__init__(self, *args, **kwargs)
+            ctk.CTk.__init__(self)
+
+    _ChatWindowBase = _DnDCTk
+else:
+    _ChatWindowBase = ctk.CTk
+
+
+class ChatWindow(_ChatWindowBase):
     def __init__(self):
         super().__init__()
         self.title(f"{AGENT_NAME} — Asisten AI Personal")
@@ -441,14 +472,29 @@ class ChatWindow(ctk.CTk):
         self.chat_area = ctk.CTkScrollableFrame(right, fg_color=BG)
         self.chat_area.pack(fill="both", expand=True)
 
+        # Drag & drop gambar langsung ke chat area (opsional, butuh
+        # tkinterdnd2 -- lihat requirements.txt). Kalau tidak terpasang,
+        # user masih bisa pakai tombol "Kirim Gambar" atau Ctrl+V.
+        if _DND_AVAILABLE:
+            try:
+                self.chat_area.drop_target_register(DND_FILES)
+                self.chat_area.dnd_bind("<<DropEnter>>", self._on_drag_enter)
+                self.chat_area.dnd_bind("<<DropLeave>>", self._on_drag_leave)
+                self.chat_area.dnd_bind("<<Drop>>", self._on_drop_wrapper)
+            except Exception:
+                # drop_target_register bisa gagal kalau root window bukan
+                # TkinterDnD.Tk() (lihat run_gui di bawah) -- app tetap
+                # jalan normal, cuma drag&drop-nya diam saja.
+                pass
+
         # Image preview bar (hidden)
         self.img_bar = ctk.CTkFrame(right, fg_color=PANEL, height=52)
 
         # Input bar
-        inbar = ctk.CTkFrame(right, fg_color=PANEL, corner_radius=0)
-        inbar.pack(fill="x", side="bottom")
-        ctk.CTkFrame(inbar, height=1, fg_color=BORDER).pack(fill="x")
-        inrow = ctk.CTkFrame(inbar, fg_color="transparent")
+        self.inbar = ctk.CTkFrame(right, fg_color=PANEL, corner_radius=0)
+        self.inbar.pack(fill="x", side="bottom")
+        ctk.CTkFrame(self.inbar, height=1, fg_color=BORDER).pack(fill="x")
+        inrow = ctk.CTkFrame(self.inbar, fg_color="transparent")
         inrow.pack(fill="x", padx=14, pady=10)
         self.input_box = ctk.CTkTextbox(
             inrow, height=50, fg_color=BORDER, border_width=0,
@@ -645,28 +691,61 @@ class ChatWindow(ctk.CTk):
             ext = Path(fp).suffix.lower()
             mt = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png",
                   ".gif": "image/gif", ".webp": "image/webp"}.get(ext, "image/jpeg")
-            self._set_pending_image(b64, mt, label=Path(fp).name)
+            self._set_pending_image(b64, mt, label=Path(fp).name, raw_bytes=raw)
         except Exception as e:
             messagebox.showerror("Error", f"Gagal buka gambar: {e}")
 
-    def _set_pending_image(self, b64: str, media_type: str, label: str):
+    def _set_pending_image(self, b64: str, media_type: str, label: str, raw_bytes: bytes = None):
         """
         Set gambar yang akan dikirim di pesan berikutnya, dan tampilkan preview
-        bar-nya. Dipanggil dari dua jalur: _attach_image (pilih file lewat
-        dialog OS) dan _paste_image_from_clipboard (Ctrl+V) — keduanya
+        bar-nya. raw_bytes (opsional) dipakai untuk render thumbnail; kalau
+        tidak diberikan, preview jatuh balik ke label teks tanpa thumbnail.
+        Dipanggil dari tiga jalur: _attach_image (dialog file), 
+        _paste_image_from_clipboard (Ctrl+V), dan _on_drop (drag & drop) —
+        semuanya
         berakhir di jalur yang sama persis, supaya gambar dari clipboard
         diperlakukan identik dengan gambar dari file.
         """
         self._pending_image = {"base64": b64, "media_type": media_type}
         for w in self.img_bar.winfo_children():
             w.destroy()
-        ctk.CTkLabel(self.img_bar, text=f"🖼️ {label}",
-                     font=ctk.CTkFont(size=12), text_color=TEXT).pack(side="left", padx=16)
+
+        # Thumbnail asli gambarnya, bukan cuma nama file. thumb_img dibuat
+        # dari raw_bytes (belum di-base64) supaya tidak perlu decode ulang.
+        thumb = None
+        if _PIL_AVAILABLE and raw_bytes is not None:
+            try:
+                im = Image.open(io.BytesIO(raw_bytes))
+                im = ImageOps.exif_transpose(im)  # hormati orientasi EXIF (foto dari HP)
+                im.thumbnail((40, 40))
+                thumb = ctk.CTkImage(light_image=im, dark_image=im, size=im.size)
+            except Exception:
+                thumb = None  # file rusak / format tak terduga -> fallback ke label teks biasa
+
+        if thumb is not None:
+            ctk.CTkLabel(self.img_bar, text="", image=thumb).pack(side="left", padx=(16, 8))
+            self._pending_thumb_ref = thumb  # cegah garbage-collected oleh Tk
+
+        ctk.CTkLabel(self.img_bar, text=label,
+                     font=ctk.CTkFont(size=12), text_color=TEXT).pack(side="left", padx=(0, 16) if thumb is not None else 16)
         ctk.CTkButton(self.img_bar, text="✕", width=28, height=28,
                       fg_color="transparent", hover_color=BORDER, text_color=MUTED,
-                      command=lambda: (self.img_bar.pack_forget(), setattr(self, "_pending_image", None))
-                      ).pack(side="right", padx=8)
-        self.img_bar.pack(fill="x", before=self.chat_area)
+                      command=self._clear_pending_image).pack(side="right", padx=8)
+
+        # PENTING: pack() sederhana di sini, TANPA `before=self.chat_area`.
+        # `before=` mengharuskan chat_area sudah punya slot di geometry
+        # manager milik parent yang sama pada saat img_bar dipasang; kalau
+        # chat masih kosong (belum ada bubble sama sekali) itu belum tentu
+        # true, dan Tk melempar "isn't packed". img_bar & chat_area sama-sama
+        # anak langsung dari `right`, dan img_bar dipasang setelah inbar,
+        # jadi taruh dia di atas inbar (side="bottom") sudah cukup untuk
+        # urutan visual yang benar tanpa bergantung pada state chat_area.
+        self.img_bar.pack(fill="x", side="bottom", before=self.inbar)
+
+    def _clear_pending_image(self):
+        self.img_bar.pack_forget()
+        self._pending_image = None
+        self._pending_thumb_ref = None
 
     def _paste_image_from_clipboard(self, event=None):
         """
@@ -719,21 +798,91 @@ class ChatWindow(ctk.CTk):
                 ext = Path(fp).suffix.lower()
                 mt = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png",
                       ".gif": "image/gif", ".webp": "image/webp"}.get(ext, "image/jpeg")
-                self._set_pending_image(b64, mt, label=Path(fp).name)
+                self._set_pending_image(b64, mt, label=Path(fp).name, raw_bytes=raw)
             elif isinstance(clip, Image.Image):
                 buf = io.BytesIO()
                 # Clipboard image biasanya tidak punya nama file / format asli
                 # yang jelas (misal hasil screenshot); simpan sebagai PNG,
                 # format lossless yang aman untuk segala jenis gambar.
                 clip.save(buf, format="PNG")
-                b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
-                self._set_pending_image(b64, "image/png", label="(gambar dari clipboard)")
+                raw = buf.getvalue()
+                b64 = base64.b64encode(raw).decode("utf-8")
+                self._set_pending_image(b64, "image/png", label="(gambar dari clipboard)", raw_bytes=raw)
             else:
                 return None  # bukan gambar, biarkan lewat sebagai paste teks biasa
         except Exception as e:
             messagebox.showerror("Error", f"Gagal memproses gambar dari clipboard: {e}")
 
         return "break"
+
+    def _on_drag_enter(self, event):
+        # Highlight border chat_area supaya jelas dia jadi target drop.
+        self.chat_area.configure(border_width=2, border_color=ACCENT)
+
+    def _on_drag_leave(self, event):
+        self.chat_area.configure(border_width=0)
+
+    def _on_drop_wrapper(self, event):
+        self.chat_area.configure(border_width=0)  # matikan highlight terlepas hasil drop-nya
+        self._on_drop(event)
+
+    def _on_drop(self, event):
+        """
+        Handler drag & drop file ke chat_area. event.data berisi path file,
+        dan kalau nama file punya spasi Tk membungkusnya dengan {kurung
+        kurawal} — perlu di-parse manual, bukan cuma di-split spasi biasa.
+        Hanya file pertama yang diambil kalau user drop beberapa sekaligus,
+        supaya perilakunya konsisten dengan _attach_image (satu gambar per
+        pesan).
+        """
+        paths = self._parse_dnd_paths(event.data)
+        if not paths:
+            return
+        fp = paths[0]
+        ext = Path(fp).suffix.lower()
+        valid_ext = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}
+        if ext not in valid_ext:
+            messagebox.showerror(
+                "Format tidak didukung",
+                f"'{Path(fp).name}' bukan file gambar yang didukung.\n\n"
+                f"Format yang didukung: {', '.join(sorted(valid_ext))}"
+            )
+            return
+        try:
+            with open(fp, "rb") as f:
+                raw = f.read()
+            b64 = base64.b64encode(raw).decode("utf-8")
+            mt = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png",
+                  ".gif": "image/gif", ".webp": "image/webp"}.get(ext, "image/jpeg")
+            self._set_pending_image(b64, mt, label=Path(fp).name, raw_bytes=raw)
+        except Exception as e:
+            messagebox.showerror("Error", f"Gagal buka gambar: {e}")
+
+    @staticmethod
+    def _parse_dnd_paths(data: str):
+        """
+        Parse string path dari event.data milik tkinterdnd2. Path yang
+        mengandung spasi dibungkus {seperti ini}, path tanpa spasi berdiri
+        bebas dipisah spasi biasa. Contoh input:
+        '{/home/user/my photo.png} /home/user/other.jpg'
+        """
+        paths, buf, in_brace = [], "", False
+        for ch in data:
+            if ch == "{":
+                in_brace = True
+            elif ch == "}":
+                in_brace = False
+                paths.append(buf)
+                buf = ""
+            elif ch == " " and not in_brace:
+                if buf:
+                    paths.append(buf)
+                    buf = ""
+            else:
+                buf += ch
+        if buf:
+            paths.append(buf)
+        return paths
 
     def _voice_input(self):
         self.send_btn.configure(text="🔴...", state="disabled")

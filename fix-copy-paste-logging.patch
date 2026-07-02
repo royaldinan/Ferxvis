@@ -1,0 +1,438 @@
+From a358e733a852af96b04c2d6b02780583bac54fd3 Mon Sep 17 00:00:00 2001
+From: Ferxvis Dev <ferxvis@local>
+Date: Thu, 2 Jul 2026 07:59:29 +0000
+Subject: [PATCH] Fix copy-paste teks, paste gambar dari clipboard, dan logging
+ untuk debug tool call
+
+1. LOGGING (untuk debug bug 'klaim berhasil padahal gagal'):
+   - Root cause baru ditemukan: qwen2.5:7b kadang TIDAK memanggil tool
+     sama sekali untuk aksi seperti create_folder, malah langsung menulis
+     jawaban teks yang 'berimajinasi' sudah eksekusi. Ini beda dari bug
+     change_directory yang diperbaiki sebelumnya.
+   - core/agent.py: tambah logging ke ferxvis.log (setiap tool call:
+     nama, argumen, hasil) + deteksi WARNING saat model mengklaim aksi
+     tanpa tool call sama sekali.
+   - Peringatan otomatis sekarang muncul di CHAT (bukan cuma file log)
+     saat kasus ini terdeteksi, supaya user tidak tertipu.
+   - config.py: system prompt dipertegas dengan aturan #0 - wajib
+     memanggil tool untuk setiap aksi nyata, dilarang keras menulis
+     kalimat 'telah dibuat/dipindah' tanpa tool call yang menyertainya.
+
+2. COPY TEKS (gui/chat_window.py):
+   - Bubble diganti dari CTkLabel (display-only, tidak bisa di-select)
+     ke CTkTextbox read-only yang mendukung select & Ctrl+C.
+   - Ctrl+A sekarang benar-benar select-all di bubble maupun input box
+     (sebelumnya tidak ada binding sama sekali).
+
+3. PASTE GAMBAR (gui/chat_window.py, requirements.txt):
+   - Ctrl+V di kotak ketik sekarang bisa membaca gambar dari clipboard
+     lewat PIL.ImageGrab, sebagai jalur kedua selain tombol 'Kirim
+     Gambar' (file dialog) yang lama - keduanya berakhir di fungsi
+     bersama _set_pending_image().
+   - Pesan error jelas kalau Pillow atau xclip/wl-clipboard belum
+     terpasang di sistem, bukan crash diam-diam.
+   - Tambah Pillow>=10.0.0 ke requirements.txt.
+
+CATATAN JUJUR: bagian GUI (poin 2 & 3) belum bisa saya jalankan/test
+langsung karena sandbox saya tidak punya display X11/Wayland maupun
+tkinter sistem. Sudah divalidasi lolos py_compile (sintaks valid) dan
+disusun mengikuti API customtkinter/PIL yang terdokumentasi, tapi
+perlu ditest langsung di laptop user. Kalau ada error runtime, kirim
+pesan errornya untuk diperbaiki berdasarkan error asli.
+---
+ .gitignore         |   3 +
+ config.py          |  13 ++++
+ core/agent.py      |  65 +++++++++++++++-
+ gui/chat_window.py | 182 +++++++++++++++++++++++++++++++++++++++++----
+ requirements.txt   |   1 +
+ 5 files changed, 248 insertions(+), 16 deletions(-)
+ create mode 100644 .gitignore
+
+diff --git a/.gitignore b/.gitignore
+new file mode 100644
+index 0000000..4352917
+--- /dev/null
++++ b/.gitignore
+@@ -0,0 +1,3 @@
++__pycache__/
++*.pyc
++ferxvis.log
+diff --git a/config.py b/config.py
+index fb100e1..53aa67e 100644
+--- a/config.py
++++ b/config.py
+@@ -44,6 +44,19 @@ SYSTEM_PROMPT = f"""Kamu adalah Ferxvis, asisten AI personal yang ramah, ringkas
+ Kamu bisa membantu mengelola file, folder, dokumen Office, mencari info di internet, membaca/mengirim
+ email, dan mengirim pesan WhatsApp (lewat WhatsApp Business API resmi).
+ 
++ATURAN PALING PENTING - WAJIB PANGGIL TOOL UNTUK SETIAP AKSI NYATA:
++0. Kamu TIDAK PUNYA kemampuan mengubah file/folder di komputer user hanya dengan menulis
++   kalimat. Satu-satunya cara sesuatu benar-benar terjadi di komputer user adalah dengan
++   MEMANGGIL TOOL (function call) yang sesuai — create_folder, write_note, move_file,
++   delete_file, change_directory, dst. Menulis kalimat seperti "folder telah dibuat" atau
++   "berhasil dipindahkan" TANPA memanggil tool yang bersangkutan adalah BOHONG dan SANGAT
++   DILARANG, walau kelihatan seperti jawaban yang membantu.
++   Setiap kali user memintamu MEMBUAT, MENULIS, MEMINDAHKAN, MENGHAPUS, atau MENGUBAH
++   sesuatu, langkah PERTAMA yang harus kamu lakukan adalah memanggil tool yang sesuai —
++   BUKAN menulis paragraf yang menjelaskan bahwa kamu "akan melakukan" atau "telah
++   melakukan" hal itu. Panggil tool-nya dulu, baru setelah ada hasil tool yang nyata,
++   susun jawaban ke user berdasarkan hasil tersebut.
++
+ ATURAN PENTING SOAL WORKSPACE:
+ 1. relative_path="" (string kosong) berarti FOLDER UTAMA workspace itu sendiri (home folder user).
+    JANGAN PERNAH membuat folder perantara baru bernama "workspace", "organized", "Organized",
+diff --git a/core/agent.py b/core/agent.py
+index 76aec4c..d7027c0 100644
+--- a/core/agent.py
++++ b/core/agent.py
+@@ -14,14 +14,39 @@ callback on_confirmation_needed. Eksekusi hanya lanjut kalau user mengonfirmasi
+ """
+ 
+ import json
++import logging
++import os
+ import time
+ from typing import Optional
+ 
+-from config import SYSTEM_PROMPT, MAX_TOOL_ITERATIONS, TOOLS_REQUIRING_CONFIRMATION
++from config import SYSTEM_PROMPT, MAX_TOOL_ITERATIONS, TOOLS_REQUIRING_CONFIRMATION, BASE_DIR
+ from core.llm_client import chat, OllamaError
+ from core.memory import load_memory, save_memory
+ from tools.registry import TOOL_DEFINITIONS, execute_tool
+ 
++# ── Logging ───────────────────────────────────────────────────────────
++# Mencatat setiap tool call (nama, argumen, hasil) dan setiap jawaban final
++# model ke file log, supaya kasus "model bilang berhasil padahal tool tidak
++# pernah dipanggil / gagal" bisa ditelusuri persis, bukan sekadar diduga-duga.
++# File log ada di root project, misal: /home/ferxan/Downloads/ferxvis/ferxvis/ferxvis.log
++_LOG_PATH = os.path.join(BASE_DIR, "ferxvis.log")
++logger = logging.getLogger("ferxvis.agent")
++if not logger.handlers:
++    logger.setLevel(logging.DEBUG)
++    _handler = logging.FileHandler(_LOG_PATH, encoding="utf-8", delay=False)
++    _handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
++    logger.addHandler(_handler)
++    logger.propagate = False
++
++    # Pastikan setiap baris log langsung ditulis ke disk (bukan menunggu buffer
++    # penuh atau proses berakhir), supaya file log bisa dicek kapan saja saat
++    # aplikasi masih berjalan, termasuk untuk debugging langsung oleh user.
++    _orig_emit = _handler.emit
++    def _emit_and_flush(record):
++        _orig_emit(record)
++        _handler.flush()
++    _handler.emit = _emit_and_flush
++
+ 
+ class PendingConfirmation:
+     """Menyimpan satu tool call yang sedang menunggu konfirmasi user."""
+@@ -124,6 +149,7 @@ class FerxvisAgent:
+                 time.sleep(3)  # Hindari rate limit Groq
+                 response = chat(self.history, tools=TOOL_DEFINITIONS)
+             except OllamaError as e:
++                logger.error(f"OllamaError: {e}")
+                 return f"⚠️ {e}"
+ 
+             message = response.get("message", {})
+@@ -131,6 +157,41 @@ class FerxvisAgent:
+ 
+             if not tool_calls:
+                 final_text = (message.get("content") or "").strip()
++                # PENTING untuk debugging: log kasus di mana model TIDAK memanggil
++                # tool sama sekali, tapi jawabannya "terdengar" seperti melakukan
++                # sesuatu (mengandung kata kerja aksi). Ini menangkap persis kasus
++                # "model berimajinasi sudah memanggil tool padahal tidak pernah".
++                sounds_like_action = any(
++                    kw in final_text.lower()
++                    for kw in ("berhasil", "telah dibuat", "sudah dibuat", "telah dipindah", "telah dihapus")
++                )
++                if sounds_like_action:
++                    last_user_msg = next(
++                        (m.get("content", "") for m in reversed(self.history) if m.get("role") == "user"),
++                        "?",
++                    )
++                    logger.warning(
++                        f"MODEL MENGKLAIM AKSI TANPA TOOL CALL. "
++                        f"User message terakhir: {last_user_msg[:200]!r}. "
++                        f"Jawaban model: {final_text[:300]!r}"
++                    )
++                    # Ini kasus PALING berbahaya untuk user: model menulis kalimat
++                    # seperti "telah dibuat" / "berhasil dipindah" padahal TIDAK
++                    # PERNAH memanggil tool sama sekali (jadi tidak ada eksekusi
++                    # nyata apapun di filesystem). Diam-diam mencatat ke log saja
++                    # tidak cukup karena user tidak akan pernah membaca file log
++                    # itu di tengah percakapan biasa. Peringatan ini WAJIB tampil
++                    # di chat, bukan cuma di file log.
++                    final_text = (
++                        f"{final_text}\n\n"
++                        f"⚠️ Catatan otomatis: jawaban di atas TIDAK disertai eksekusi tool apapun "
++                        f"(tidak ada perintah yang benar-benar dijalankan ke file/folder). Kemungkinan "
++                        f"besar aksi ini BELUM benar-benar terjadi, meski kalimatnya terdengar seperti "
++                        f"sudah selesai. Coba minta lagi dengan kalimat yang lebih spesifik, atau cek "
++                        f"langsung pakai 'lihat isi folder Documents' untuk memastikan."
++                    )
++                else:
++                    logger.info(f"Jawaban final tanpa tool call: {final_text[:200]!r}")
+ 
+                 if last_unreported_error and not self._mentions_failure(final_text):
+                     final_text = (
+@@ -168,11 +229,13 @@ class FerxvisAgent:
+ 
+                 if tool_name in TOOLS_REQUIRING_CONFIRMATION:
+                     # Tahan eksekusi, minta konfirmasi user dulu.
++                    logger.info(f"TOOL CALL (menunggu konfirmasi): {tool_name}({raw_args})")
+                     self._pending_confirmation = PendingConfirmation(tool_name, raw_args)
+                     save_memory(self.history)
+                     return self.confirmation_prompt_text()
+ 
+                 result = execute_tool(tool_name, raw_args)
++                logger.info(f"TOOL CALL: {tool_name}({raw_args}) -> {result[:300] if isinstance(result, str) else result!r}")
+ 
+                 if on_tool_call:
+                     on_tool_call(tool_name, raw_args, result)
+diff --git a/gui/chat_window.py b/gui/chat_window.py
+index cf38192..16bb17d 100644
+--- a/gui/chat_window.py
++++ b/gui/chat_window.py
+@@ -7,6 +7,7 @@ Kompatibel dengan repo asli royaldinan/Ferxvis
+ import threading
+ import json
+ import os
++import io
+ import base64
+ import datetime
+ from pathlib import Path
+@@ -15,6 +16,12 @@ import customtkinter as ctk
+ import tkinter as tk
+ from tkinter import filedialog, messagebox
+ 
++try:
++    from PIL import ImageGrab, Image
++    _PIL_AVAILABLE = True
++except ImportError:
++    _PIL_AVAILABLE = False
++
+ from core.agent import FerxvisAgent
+ from core.llm_client import check_ollama_running, check_model_available
+ from config import AGENT_NAME, MODEL_NAME, WORKSPACE_DIR
+@@ -284,6 +291,19 @@ class ClipboardPanel(ctk.CTkToplevel):
+ 
+ 
+ # ── Bubble Widget ─────────────────────────────────────────────
++def _estimate_wrapped_lines(text: str, wrap_chars: int = 78) -> int:
++    """
++    Perkiraan jumlah baris setelah word-wrap, untuk menentukan tinggi CTkTextbox.
++    Tidak perlu presisi sempurna (textbox tetap bisa di-scroll kalau meleset),
++    cukup dekat supaya bubble tidak terlalu pendek (teks terpotong) atau
++    terlalu tinggi (banyak area kosong di bawah).
++    """
++    total = 0
++    for line in (text or "").split("\n"):
++        total += max(1, -(-len(line) // wrap_chars))  # ceil division
++    return max(1, total)
++
++
+ class Bubble(ctk.CTkFrame):
+     def __init__(self, parent, role, text, **kw):
+         super().__init__(parent, fg_color="transparent", **kw)
+@@ -295,11 +315,49 @@ class Bubble(ctk.CTkFrame):
+         label_text = f"{icon}  {text}" if icon else text
+         container = ctk.CTkFrame(self, fg_color="transparent")
+         container.pack(fill="x", pady=2)
+-        ctk.CTkLabel(
+-            container, text=label_text, justify="left",
+-            wraplength=600, fg_color=bg, corner_radius=12,
+-            padx=14, pady=10, font=ctk.CTkFont(size=13), text_color=TEXT,
+-        ).pack(anchor=anchor, padx=12)
++
++        n_lines = _estimate_wrapped_lines(label_text)
++        line_height_px = 20  # kira-kira, mengikuti font size=13 + padding baris
++        height = min(max(n_lines * line_height_px + 20, 40), 500)  # clamp, textbox bisa di-scroll kalau lebih panjang
++
++        # CTkTextbox dipakai (bukan CTkLabel) supaya teks bisa di-select dan
++        # di-copy oleh user — CTkLabel murni display, tidak punya text
++        # selection sama sekali. state="normal" tetap dipakai (bukan
++        # "disabled") supaya selection & Ctrl+C jalan normal di Tk;
++        # pengeditan dicegah lewat binding key/paste di bawah, bukan lewat
++        # men-disable widget-nya.
++        self.textbox = ctk.CTkTextbox(
++            container, wrap="word", fg_color=bg, corner_radius=12,
++            border_width=0, padx=14, pady=10,
++            font=ctk.CTkFont(size=13), text_color=TEXT,
++            height=height, activate_scrollbars=False,
++        )
++        self.textbox.insert("1.0", label_text)
++        self._make_readonly(self.textbox)
++        self.textbox.pack(anchor=anchor, padx=12, fill="x" if False else "none")
++
++        # Lebar mengikuti proporsi window, meniru wraplength=600 versi lama.
++        self.textbox.configure(width=min(620, max(200, int(len(max(label_text.split(chr(10)), key=len, default="")) * 7.2))))
++
++    @staticmethod
++    def _make_readonly(textbox: ctk.CTkTextbox):
++        """
++        Cegah user mengetik/menghapus isi bubble, TANPA mematikan
++        kemampuan select & copy (yang akan hilang kalau pakai
++        state="disabled" di beberapa versi CTkTextbox/Tk).
++        """
++        def _block_edit(event):
++            # Izinkan kombinasi copy & select-all, blok semua input lain
++            # yang bisa mengubah isi (ketik huruf, Delete, Backspace, paste, dst).
++            ctrl = (event.state & 0x4) != 0  # bitmask Control di X11/Tk
++            if ctrl and event.keysym.lower() in ("c", "a"):
++                return None  # biarkan lewat (copy / select-all)
++            return "break"  # blok semua tombol lain
++
++        textbox.bind("<Key>", _block_edit)
++        textbox.bind("<<Paste>>", lambda e: "break")
++        textbox.bind("<Control-a>", lambda e: (textbox._textbox.tag_add("sel", "1.0", "end"), "break"))
++        textbox.bind("<Control-A>", lambda e: (textbox._textbox.tag_add("sel", "1.0", "end"), "break"))
+ 
+ 
+ # ── Main Window ───────────────────────────────────────────────
+@@ -397,6 +455,23 @@ class ChatWindow(ctk.CTk):
+             corner_radius=10, font=ctk.CTkFont(size=13), text_color=TEXT)
+         self.input_box.pack(side="left", fill="x", expand=True, padx=(0, 10))
+         self.input_box.bind("<Return>", self._on_enter)
++        # Ctrl+A default Tk BUKAN select-all (di beberapa binding malah loncat
++        # ke awal baris, gaya Emacs). Override eksplisit di sini supaya Ctrl+A
++        # benar-benar memilih semua teks yang sedang diketik.
++        self.input_box.bind(
++            "<Control-a>",
++            lambda e: (self.input_box._textbox.tag_add("sel", "1.0", "end"), "break")
++        )
++        self.input_box.bind(
++            "<Control-A>",
++            lambda e: (self.input_box._textbox.tag_add("sel", "1.0", "end"), "break")
++        )
++        # Ctrl+V: kalau isi clipboard gambar, pasang sebagai pending image
++        # (sama seperti klik tombol "Kirim Gambar"). Kalau isi clipboard
++        # teks biasa, _paste_image_from_clipboard mengembalikan None supaya
++        # event diteruskan ke binding paste teks bawaan CTkTextbox.
++        self.input_box.bind("<Control-v>", self._paste_image_from_clipboard)
++        self.input_box.bind("<Control-V>", self._paste_image_from_clipboard)
+         self.send_btn = ctk.CTkButton(
+             inrow, text="Kirim ➤", width=90, height=50,
+             fg_color=ACCENT, hover_color="#2d75d4",
+@@ -570,19 +645,96 @@ class ChatWindow(ctk.CTk):
+             ext = Path(fp).suffix.lower()
+             mt = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png",
+                   ".gif": "image/gif", ".webp": "image/webp"}.get(ext, "image/jpeg")
+-            self._pending_image = {"base64": b64, "media_type": mt}
+-            for w in self.img_bar.winfo_children():
+-                w.destroy()
+-            ctk.CTkLabel(self.img_bar, text=f"🖼️ {Path(fp).name}",
+-                         font=ctk.CTkFont(size=12), text_color=TEXT).pack(side="left", padx=16)
+-            ctk.CTkButton(self.img_bar, text="✕", width=28, height=28,
+-                          fg_color="transparent", hover_color=BORDER, text_color=MUTED,
+-                          command=lambda: (self.img_bar.pack_forget(), setattr(self, "_pending_image", None))
+-                          ).pack(side="right", padx=8)
+-            self.img_bar.pack(fill="x", before=self.chat_area)
++            self._set_pending_image(b64, mt, label=Path(fp).name)
+         except Exception as e:
+             messagebox.showerror("Error", f"Gagal buka gambar: {e}")
+ 
++    def _set_pending_image(self, b64: str, media_type: str, label: str):
++        """
++        Set gambar yang akan dikirim di pesan berikutnya, dan tampilkan preview
++        bar-nya. Dipanggil dari dua jalur: _attach_image (pilih file lewat
++        dialog OS) dan _paste_image_from_clipboard (Ctrl+V) — keduanya
++        berakhir di jalur yang sama persis, supaya gambar dari clipboard
++        diperlakukan identik dengan gambar dari file.
++        """
++        self._pending_image = {"base64": b64, "media_type": media_type}
++        for w in self.img_bar.winfo_children():
++            w.destroy()
++        ctk.CTkLabel(self.img_bar, text=f"🖼️ {label}",
++                     font=ctk.CTkFont(size=12), text_color=TEXT).pack(side="left", padx=16)
++        ctk.CTkButton(self.img_bar, text="✕", width=28, height=28,
++                      fg_color="transparent", hover_color=BORDER, text_color=MUTED,
++                      command=lambda: (self.img_bar.pack_forget(), setattr(self, "_pending_image", None))
++                      ).pack(side="right", padx=8)
++        self.img_bar.pack(fill="x", before=self.chat_area)
++
++    def _paste_image_from_clipboard(self, event=None):
++        """
++        Tangani Ctrl+V: kalau isi clipboard adalah GAMBAR (bukan teks),
++        pasang sebagai pending image (jalur sama dengan tombol "Kirim Gambar").
++        Kalau isi clipboard teks biasa, biarkan lewat ke perilaku paste teks
++        normal di textbox (return None, JANGAN "break").
++        """
++        if not _PIL_AVAILABLE:
++            messagebox.showerror(
++                "Fitur belum aktif",
++                "Paste gambar butuh library Pillow. Jalankan:\n\npip install Pillow\n\n"
++                "lalu restart Ferxvis."
++            )
++            return "break"
++
++        try:
++            clip = ImageGrab.grabclipboard()
++        except Exception as e:
++            # Di Linux, ImageGrab.grabclipboard() butuh xclip atau wl-clipboard
++            # terpasang di OS (bukan cuma pip package). Kalau tidak ada,
++            # Pillow melempar exception yang membingungkan kalau tidak
++            # dijelaskan ulang di sini.
++            messagebox.showerror(
++                "Gagal membaca clipboard",
++                f"Tidak bisa membaca gambar dari clipboard.\n\n"
++                f"Di Linux, ini butuh 'xclip' (X11) atau 'wl-clipboard' (Wayland) "
++                f"terpasang di sistem. Coba jalankan salah satu:\n\n"
++                f"  sudo dnf install xclip\n"
++                f"  sudo dnf install wl-clipboard\n\n"
++                f"Detail error: {e}"
++            )
++            return "break"
++
++        if clip is None:
++            # Clipboard kosong ATAU isinya teks biasa (grabclipboard hanya
++            # menangkap gambar/file, bukan teks). Biarkan event lanjut ke
++            # binding paste teks normal milik CTkTextbox.
++            return None
++
++        # grabclipboard() bisa mengembalikan objek PIL.Image langsung
++        # (screenshot / copy dari image viewer), ATAU list path file
++        # (kalau user copy file gambar dari file manager).
++        try:
++            if isinstance(clip, list) and clip:
++                fp = clip[0]
++                with open(fp, "rb") as f:
++                    raw = f.read()
++                b64 = base64.b64encode(raw).decode("utf-8")
++                ext = Path(fp).suffix.lower()
++                mt = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png",
++                      ".gif": "image/gif", ".webp": "image/webp"}.get(ext, "image/jpeg")
++                self._set_pending_image(b64, mt, label=Path(fp).name)
++            elif isinstance(clip, Image.Image):
++                buf = io.BytesIO()
++                # Clipboard image biasanya tidak punya nama file / format asli
++                # yang jelas (misal hasil screenshot); simpan sebagai PNG,
++                # format lossless yang aman untuk segala jenis gambar.
++                clip.save(buf, format="PNG")
++                b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
++                self._set_pending_image(b64, "image/png", label="(gambar dari clipboard)")
++            else:
++                return None  # bukan gambar, biarkan lewat sebagai paste teks biasa
++        except Exception as e:
++            messagebox.showerror("Error", f"Gagal memproses gambar dari clipboard: {e}")
++
++        return "break"
++
+     def _voice_input(self):
+         self.send_btn.configure(text="🔴...", state="disabled")
+         def task():
+diff --git a/requirements.txt b/requirements.txt
+index 55f51a9..3335e39 100644
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -1,6 +1,7 @@
+ customtkinter>=5.2.0
+ python-docx>=1.1.0
+ openpyxl>=3.1.0
++Pillow>=10.0.0   # dipakai untuk paste gambar dari clipboard (Ctrl+V)
+ 
+ # Untuk integrasi Email (Gmail) - opsional, hanya perlu kalau mau pakai fitur email
+ google-auth-oauthlib>=1.2.0
+-- 
+2.43.0
+

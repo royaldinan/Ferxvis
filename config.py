@@ -6,7 +6,13 @@ import os
 
 # ── Ollama Settings ───────────────────────────────────────────
 OLLAMA_HOST = "http://localhost:11434"
-OLLAMA_MODEL_NAME = os.environ.get("FERXVIS_OLLAMA_MODEL", "qwen2.5:7b")
+# qwen3:8b dipilih di atas qwen2.5:7b karena tool-calling jauh lebih stabil
+# (dilatih dengan tag "tools" resmi dari Ollama, format <tool_call> lebih
+# ketat) -- ini yang paling sering bikin qwen2.5:7b "mengarang" sudah
+# berhasil padahal tidak pernah memanggil tool. Trade-off: qwen3:8b adalah
+# hybrid thinking model, jadi tiap respons sedikit lebih lambat karena
+# "berpikir" dulu sebelum menjawab / memanggil tool.
+OLLAMA_MODEL_NAME = os.environ.get("FERXVIS_OLLAMA_MODEL", "qwen3:8b")
 MODEL_NAME = OLLAMA_MODEL_NAME
 
 # ── Sandbox Settings ──────────────────────────────────────────
@@ -15,7 +21,13 @@ WORKSPACE_DIR = os.path.expanduser("~")
 os.makedirs(WORKSPACE_DIR, exist_ok=True)
 
 # ── Agent Settings ────────────────────────────────────────────
-MAX_TOOL_ITERATIONS = 8
+# 60 (naik dari default 8) supaya tugas dengan banyak tool call berturut-turut
+# (misal reorganisasi puluhan file) tidak kepotong paksa di tengah jalan.
+# Efek samping: kalau model benar-benar nyasar ke loop tanpa akhir (jarang,
+# tapi bisa terjadi di model kecil), agent akan mencoba lebih lama sebelum
+# menyerah -- lihat pesan "prosesnya jadi terlalu panjang" di agent.py kalau
+# ini pernah tersentuh.
+MAX_TOOL_ITERATIONS = 60
 AGENT_NAME = "Ferxvis"
 
 # ── Web Search ────────────────────────────────────────────────

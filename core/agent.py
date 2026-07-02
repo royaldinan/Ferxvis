@@ -16,13 +16,14 @@ callback on_confirmation_needed. Eksekusi hanya lanjut kalau user mengonfirmasi 
 import json
 import logging
 import os
+import re
 import time
 from typing import Optional
 
 from config import SYSTEM_PROMPT, MAX_TOOL_ITERATIONS, TOOLS_REQUIRING_CONFIRMATION, BASE_DIR
 from core.llm_client import chat, OllamaError
 from core.memory import load_memory, save_memory
-from tools.registry import TOOL_DEFINITIONS, execute_tool
+from tools.registry import TOOL_DEFINITIONS, execute_tool, TOOL_FUNCTIONS
 
 # ── Logging ───────────────────────────────────────────────────────────
 # Mencatat setiap tool call (nama, argumen, hasil) dan setiap jawaban final
@@ -46,6 +47,53 @@ if not logger.handlers:
         _orig_emit(record)
         _handler.flush()
     _handler.emit = _emit_and_flush
+
+
+# ── Fallback parser: tool call yang "ditulis sebagai teks" ─────────────
+# BUG YANG SUDAH TERDOKUMENTASI LUAS (qwen2.5 + Ollama, lihat misal
+# github.com/NousResearch/hermes-agent/issues/5867 dan
+# github.com/ollama/ollama/issues/7051): model kadang menulis representasi
+# tool call sebagai JSON string di dalam `content`, alih-alih mengisi field
+# `tool_calls` resmi di response API. Contoh persis yang tertangkap dari
+# Ferxvis (lihat screenshot user 2 Jul 2026):
+#
+#   ```json
+#   {"name": "create_folder", "arguments": {"relative_path": "success1"}}
+#   ```
+#   Folder 'success1' telah dibuat di dalam folder Documents.
+#
+# Tanpa fallback ini, teks di atas dianggap jawaban biasa (tidak ada
+# tool_calls terisi), sehingga tool TIDAK PERNAH benar-benar dieksekusi,
+# padahal secara visual sangat meyakinkan seolah sudah dieksekusi.
+_FAKE_TOOL_CALL_PATTERN = re.compile(
+    r'```(?:json)?\s*\n?\s*(\{[^`]*?"name"\s*:\s*"[^"]+?"[^`]*?\})\s*\n?\s*```',
+    re.DOTALL,
+)
+
+
+def extract_fake_tool_calls_from_text(text: str) -> list[dict]:
+    """
+    Cari pola JSON tool-call-looking di dalam teks bebas (biasanya di dalam
+    code fence ```json ... ```), dan kembalikan sebagai list of dict
+    {"name": ..., "arguments": ...} — HANYA untuk nama tool yang benar-benar
+    terdaftar di TOOL_FUNCTIONS (supaya tidak asal eksekusi apapun yang
+    "kebetulan" berbentuk JSON dengan key "name").
+    """
+    found = []
+    for match in _FAKE_TOOL_CALL_PATTERN.finditer(text or ""):
+        raw = match.group(1)
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        name = parsed.get("name")
+        if not isinstance(name, str) or name not in TOOL_FUNCTIONS:
+            continue  # bukan nama tool yang valid, abaikan (mungkin memang contoh kode biasa)
+        args = parsed.get("arguments", {})
+        if not isinstance(args, dict):
+            continue
+        found.append({"name": name, "arguments": args})
+    return found
 
 
 class PendingConfirmation:
@@ -157,6 +205,68 @@ class FerxvisAgent:
 
             if not tool_calls:
                 final_text = (message.get("content") or "").strip()
+
+                # ── Fallback: cek apakah model sebenarnya "mau" memanggil tool,
+                # tapi menuliskannya sebagai teks JSON alih-alih tool_calls resmi
+                # (bug qwen2.5+Ollama yang terdokumentasi, lihat komentar di atas
+                # extract_fake_tool_calls_from_text). Kalau ditemukan, EKSEKUSI
+                # BENERAN tool tersebut sekarang, alih-alih menganggapnya sekadar
+                # teks dan berakhir di jawaban final yang bohong.
+                fake_calls = extract_fake_tool_calls_from_text(final_text)
+                if fake_calls:
+                    logger.warning(
+                        f"TOOL CALL DITULIS SEBAGAI TEKS (bukan tool_calls resmi), "
+                        f"dieksekusi via fallback parser: {fake_calls}"
+                    )
+                    # Simpan pesan asli model ke history dulu (apa adanya, supaya
+                    # riwayat percakapan tetap konsisten), baru proses tool-nya.
+                    self.history.append({"role": "assistant", "content": final_text})
+
+                    executed_summaries = []
+                    any_error = False
+                    for fc in fake_calls:
+                        name, args = fc["name"], fc["arguments"]
+                        if name in TOOLS_REQUIRING_CONFIRMATION:
+                            # Tool sensitif tetap harus lewat konfirmasi user biasa,
+                            # tidak boleh dieksekusi otomatis walau lewat fallback ini.
+                            self._pending_confirmation = PendingConfirmation(name, args)
+                            save_memory(self.history)
+                            return self.confirmation_prompt_text()
+
+                        result = execute_tool(name, args)
+                        logger.info(f"FALLBACK TOOL CALL: {name}({args}) -> {result[:300] if isinstance(result, str) else result!r}")
+                        if on_tool_call:
+                            on_tool_call(name, args, result)
+                        if isinstance(result, str) and result.startswith("ERROR"):
+                            any_error = True
+                        executed_summaries.append(result)
+                        self.history.append({
+                            "role": "tool",
+                            "tool_call_id": f"call_fallback_{name}",
+                            "content": result,
+                        })
+
+                    # Beri tahu user secara eksplisit bahwa ini lewat jalur fallback,
+                    # supaya tidak menimbulkan kesan "semua baik-baik saja" kalau
+                    # ternyata modelnya memang tidak stabil soal ini.
+                    note = (
+                        "\n\n(Catatan teknis: model sempat menulis instruksi aksi dalam bentuk "
+                        "teks, bukan lewat pemanggilan tool resmi — Ferxvis mendeteksi dan "
+                        "tetap menjalankannya secara manual.)"
+                    )
+                    combined_result = "\n".join(executed_summaries)
+                    final_text = f"{combined_result}{note}"
+                    self.history.append({"role": "assistant", "content": final_text})
+                    save_memory(self.history)
+
+                    if any_error:
+                        # Kalau salah satu eksekusi fallback gagal, jangan langsung
+                        # kembalikan sebagai jawaban final — beri model kesempatan
+                        # merespons hasil error itu di iterasi berikutnya, sama
+                        # seperti alur tool call normal.
+                        continue
+                    return final_text
+
                 # PENTING untuk debugging: log kasus di mana model TIDAK memanggil
                 # tool sama sekali, tapi jawabannya "terdengar" seperti melakukan
                 # sesuatu (mengandung kata kerja aksi). Ini menangkap persis kasus

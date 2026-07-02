@@ -1,7 +1,8 @@
 customtkinter>=5.2.0
 python-docx>=1.1.0
 openpyxl>=3.1.0
-Pillow>=10.0.0   # dipakai untuk paste gambar dari clipboard (Ctrl+V)
+Pillow>=10.0.0   # dipakai untuk paste gambar dari clipboard (Ctrl+V) dan thumbnail preview
+tkinterdnd2>=0.3.0   # dipakai untuk drag & drop gambar ke chat area (opsional, app tetap jalan tanpanya)
 
 # Untuk integrasi Email (Gmail) - opsional, hanya perlu kalau mau pakai fitur email
 google-auth-oauthlib>=1.2.0

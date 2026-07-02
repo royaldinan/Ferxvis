@@ -87,7 +87,7 @@ def chat(messages: list, tools: list = None, temperature: float = 0.4) -> dict:
     )
 
     try:
-        with urllib.request.urlopen(req, timeout=120) as resp:
+        with urllib.request.urlopen(req, timeout=600) as resp:
             return json.loads(resp.read().decode("utf-8"))
     except urllib.error.URLError as e:
         raise OllamaError(
