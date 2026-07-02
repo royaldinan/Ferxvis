@@ -1,0 +1,210 @@
+"""
+Client untuk komunikasi dengan LLM - mendukung dua provider:
+1. Ollama (lokal, gratis, butuh install Ollama)
+2. Groq (API cloud, butuh API key, jauh lebih cepat)
+
+Provider dipilih lewat config.py (LLM_PROVIDER). API key TIDAK PERNAH ditulis di kode -
+selalu dibaca dari environment variable (lihat config.py untuk cara setnya).
+"""
+
+import json
+import urllib.request
+import urllib.error
+
+from config import (
+    LLM_PROVIDER,
+    OLLAMA_HOST, OLLAMA_MODEL_NAME,
+    GROQ_API_KEY, GROQ_BASE_URL, GROQ_MODEL_NAME,
+)
+
+
+class OllamaError(Exception):
+    """Dilempar saat ada masalah komunikasi dengan LLM (Ollama maupun Groq)."""
+    pass
+
+
+# ── Status check (dipakai GUI untuk menampilkan indikator siap/tidak) ────────
+
+def check_ollama_running() -> bool:
+    """Cek apakah backend LLM yang dikonfigurasi siap dipakai."""
+    if LLM_PROVIDER == "groq":
+        return bool(GROQ_API_KEY)
+
+    try:
+        req = urllib.request.Request(f"{OLLAMA_HOST}/api/tags")
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            return resp.status == 200
+    except Exception:
+        return False
+
+
+def check_model_available(model_name: str = None) -> bool:
+    """Cek apakah model yang dikonfigurasi sudah tersedia."""
+    if LLM_PROVIDER == "groq":
+        # Untuk Groq, "tersedia" cukup diartikan sebagai "API key terisi" -
+        # validasi nama model yang sesungguhnya baru ketahuan saat request pertama.
+        return bool(GROQ_API_KEY)
+
+    model_name = model_name or OLLAMA_MODEL_NAME
+    try:
+        req = urllib.request.Request(f"{OLLAMA_HOST}/api/tags")
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            models = [m["name"] for m in data.get("models", [])]
+            return any(m == model_name or m.startswith(model_name.split(":")[0]) for m in models)
+    except Exception:
+        return False
+
+
+# ── Backend: Ollama ───────────────────────────────────────────
+
+def _clean_messages_for_ollama(messages: list) -> list:
+    """Hapus field Groq-specific yang bikin Ollama error (tool_call_id, dll)."""
+    cleaned = []
+    for m in messages:
+        role = m.get("role")
+        if role == "tool":
+            # Ollama tidak pakai tool_call_id - hapus field itu
+            cleaned.append({"role": "tool", "content": m.get("content", "")})
+        elif role == "assistant":
+            msg = {"role": "assistant", "content": m.get("content", "") or ""}
+            if m.get("tool_calls"):
+                # Bersihkan tool_calls - hapus field id dan type yang bikin error
+                clean_calls = []
+                for call in m["tool_calls"]:
+                    func = call.get("function", {})
+                    args = func.get("arguments", {})
+                    if isinstance(args, str):
+                        import json as _json
+                        try:
+                            args = _json.loads(args)
+                        except:
+                            args = {}
+                    clean_calls.append({
+                        "function": {
+                            "name": func.get("name", ""),
+                            "arguments": args
+                        }
+                    })
+                msg["tool_calls"] = clean_calls
+            cleaned.append(msg)
+        else:
+            cleaned.append({"role": role, "content": m.get("content", "")})
+    return cleaned
+
+
+def _chat_ollama(messages: list, tools: list, temperature: float) -> dict:
+    messages = _clean_messages_for_ollama(messages)
+    payload = {
+        "model": OLLAMA_MODEL_NAME,
+        "messages": messages,
+        "stream": False,
+        "options": {"temperature": temperature},
+        "tools": tools if tools else [],
+    }
+
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        f"{OLLAMA_HOST}/api/chat",
+        data=data,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.URLError as e:
+        raise OllamaError(
+            f"Tidak bisa terhubung ke Ollama di {OLLAMA_HOST}. "
+            f"Pastikan Ollama sudah jalan (jalankan 'ollama serve' di terminal). Detail: {e}"
+        )
+    except Exception as e:
+        raise OllamaError(f"Error saat memanggil Ollama: {e}")
+
+
+# ── Backend: Groq (OpenAI-compatible) ─────────────────────────
+
+def _chat_groq(messages: list, tools: list, temperature: float) -> dict:
+    if not GROQ_API_KEY:
+        raise OllamaError(
+            "GROQ_API_KEY belum diset. Set environment variable GROQ_API_KEY dengan API key "
+            "kamu sebelum jalankan aplikasi (lihat README.md bagian 'Setup Groq API'). "
+            "Jangan pernah taruh API key langsung di file kode."
+        )
+
+    payload = {
+        "model": GROQ_MODEL_NAME,
+        "messages": messages,
+        "temperature": temperature,
+    }
+    if tools:
+        payload["tools"] = tools
+
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        f"{GROQ_BASE_URL}/chat/completions",
+        data=data,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {GROQ_API_KEY}",
+            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
+        },
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            result = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="ignore")
+        try:
+            err_json = json.loads(body)
+            err_msg = err_json.get("error", {}).get("message", body)
+        except json.JSONDecodeError:
+            err_msg = body
+        if e.code == 401:
+            raise OllamaError("GROQ_API_KEY tidak valid atau sudah dicabut (revoked). Cek kembali key kamu.")
+        if e.code == 429:
+            raise OllamaError("Rate limit Groq tercapai. Tunggu sebentar, atau cek kuota di console.groq.com.")
+        if e.code == 404:
+            raise OllamaError(
+                f"Model '{GROQ_MODEL_NAME}' tidak ditemukan di Groq (mungkin sudah deprecated). "
+                f"Cek daftar model aktif di https://console.groq.com/docs/models, lalu set "
+                f"environment variable FERXVIS_GROQ_MODEL ke model yang masih aktif."
+            )
+        raise OllamaError(f"Groq API mengembalikan error HTTP {e.code}: {err_msg}")
+    except urllib.error.URLError as e:
+        raise OllamaError(f"Tidak bisa terhubung ke Groq API. Cek koneksi internet kamu. Detail: {e}")
+    except Exception as e:
+        raise OllamaError(f"Error saat memanggil Groq API: {e}")
+
+    # Normalisasi respons Groq (format OpenAI) ke format yang dipakai agent.py (gaya Ollama):
+    # Ollama: {"message": {"role": ..., "content": ..., "tool_calls": [...]}}
+    # Groq/OpenAI: {"choices": [{"message": {...}}]}
+    choices = result.get("choices", [])
+    if not choices:
+        raise OllamaError(f"Respons Groq tidak berisi 'choices'. Respons mentah: {result}")
+
+    message = choices[0].get("message", {})
+
+    # Format tool_calls Groq/OpenAI sedikit beda dari Ollama: arguments berupa STRING JSON,
+    # bukan dict langsung. agent.py sudah menangani string ini (json.loads di sana), jadi
+    # tidak perlu konversi tambahan di sini - cukup pastikan strukturnya konsisten.
+    return {"message": message}
+
+
+# ── Fungsi publik (dipanggil oleh core/agent.py) ──────────────
+
+def chat(messages: list, tools: list = None, temperature: float = 0.4) -> dict:
+    """
+    Kirim percakapan ke LLM (Ollama atau Groq, sesuai config.LLM_PROVIDER) dan dapatkan respons.
+
+    messages: list of {"role": "system"/"user"/"assistant"/"tool", "content": str, ...}
+    tools: list of tool definitions (format OpenAI-style function calling)
+
+    Return: dict dengan key "message" berisi respons (format konsisten antar provider).
+    """
+    if LLM_PROVIDER == "groq":
+        return _chat_groq(messages, tools, temperature)
+    return _chat_ollama(messages, tools, temperature)

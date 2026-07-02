@@ -1,6 +1,9 @@
 # 🤖 Ferxvis — Asisten AI Lokal
 
-Ferxvis adalah asisten AI personal yang jalan 100% di laptop kamu lewat LLM lokal (Qwen).
+Ferxvis adalah asisten AI personal yang bisa jalan dengan dua cara:
+- **Ollama (lokal)** — gratis, privat, jalan 100% di laptop kamu, tapi butuh laptop yang cukup kuat
+- **Groq (API cloud)** — jauh lebih cepat, tidak butuh laptop kuat, tapi butuh API key dan ada limit/kuota
+
 Dia bisa mengelola catatan/file/folder, membuat dokumen Word & Excel, mencari info terkini
 di internet, membaca & mengirim email, dan mengirim pesan WhatsApp — semua lewat chat
 natural language di GUI sederhana.
@@ -13,60 +16,118 @@ Supaya jelas, ini status pengujian masing-masing bagian:
 
 | Fitur | Status pengujian |
 |---|---|
-| Core agent + tool-calling loop | ✅ Diuji penuh (mock LLM, berbagai skenario) |
+| Core agent + tool-calling loop | ✅ Diuji penuh (mock LLM, berbagai skenario, kedua provider) |
+| Provider Ollama (lokal) | ✅ Diuji penuh |
+| Provider Groq (API cloud) | ✅ Logic & error handling diuji penuh dengan mock API (401/404/429, format respons asli). **Belum** dites dengan API key sungguhan yang benar-benar memanggil server Groq — itu butuh kamu coba sendiri. |
 | File & folder management (sandbox) | ✅ Diuji penuh, termasuk 7 teknik bypass sandbox |
 | Dokumen Word & Excel | ✅ Diuji penuh end-to-end |
 | GUI chatbot | ✅ Diuji penuh (render headless + simulasi interaksi nyata) |
 | Sistem konfirmasi aksi sensitif | ✅ Diuji penuh end-to-end lewat GUI |
 | Memory antar sesi | ✅ Diuji penuh (save/load/trim/corrupt-file handling) |
 | Web search (Brave API) | ✅ Logic & error handling diuji penuh dengan mock API |
-| Email (Gmail) | ✅ Logic & error handling diuji dengan mock API. **Belum** dites dengan akun Gmail asli — proses OAuth butuh browser & login interaktif yang tidak bisa disimulasikan dari sandbox pengujian saya. Kemungkinan besar jalan baik, tapi coba dulu pelan-pelan saat pertama setup. |
-| WhatsApp (Business API resmi) | ✅ Logic & error handling diuji dengan mock API. **Belum** dites dengan akun WhatsApp Business asli — butuh approval dari Meta yang di luar kendali saya. |
+| Email (Gmail) | ✅ Logic & error handling diuji dengan mock API. **Belum** dites dengan akun Gmail asli. |
+| WhatsApp (Business API resmi) | ✅ Logic & error handling diuji dengan mock API. **Belum** dites dengan akun asli. |
 
-Singkatnya: **semua yang berjalan lokal di laptop kamu (file, Office, GUI, memory) sudah
-divalidasi ketat dan seharusnya jalan tanpa masalah.** Email & WhatsApp logic-nya solid,
-tapi koneksi ke API pihak ketiga yang asli baru benar-benar teruji saat kamu coba sendiri.
+---
+
+## 🔑 PENTING — Soal API Key (baca sebelum lanjut)
+
+**Jangan PERNAH:**
+- Menulis API key langsung di file `config.py` atau file kode manapun
+- Share API key lewat chat, email, atau commit ke Git/GitHub
+- Pakai API key yang pernah kamu ketik/paste di tempat yang tidak terenkripsi (chat AI, forum, dll) — anggap key itu sudah bocor, langsung revoke dan buat yang baru
+
+**Selalu:**
+- Set API key lewat environment variable (caranya ada di bagian "Setup Groq API" di bawah)
+- Kalau API key pernah tidak sengaja terekspos (ketik di chat, screenshot, dll), langsung ke dashboard provider terkait dan **revoke key itu**, lalu generate yang baru
 
 ---
 
 ## 📋 Yang Dibutuhkan
 
 1. **Python 3.10+**
-2. **Ollama** — https://ollama.com/download
+2. **Salah satu dari:**
+   - **Ollama** (https://ollama.com/download) — untuk mode lokal, ATAU
+   - **API key Groq** (https://console.groq.com) — untuk mode cloud, gratis tanpa kartu kredit
 3. *(Opsional)* API key Brave Search — untuk fitur web search
 4. *(Opsional)* Google Cloud credentials — untuk fitur email
 5. *(Opsional)* WhatsApp Business API access — untuk fitur WhatsApp
 
-Fitur-fitur opsional di atas **tidak wajib**. Tanpa setup tambahan apapun, Ferxvis tetap
-bisa mengelola file/folder/dokumen Office sepenuhnya.
-
 ---
 
-## 🚀 Instalasi Dasar (Wajib)
+## 🚀 Instalasi Dasar
 
-### 1. Install Ollama & jalankan
-```bash
-ollama serve
-```
-Biarkan terminal ini tetap terbuka.
+### Opsi A: Mode Ollama (lokal, gratis, privat)
 
-### 2. Download model Qwen (terminal lain)
-```bash
-ollama pull qwen2.5:7b
-```
-> RAM ≤8GB → `qwen2.5:3b` &nbsp;|&nbsp; RAM 16GB → `qwen2.5:7b` (default) &nbsp;|&nbsp; RAM 32GB+ → `qwen2.5:14b`
->
-> Ganti pilihan model di `config.py` (`MODEL_NAME`).
+1. Install Ollama dari https://ollama.com/download, lalu jalankan:
+   ```bash
+   ollama serve
+   ```
+   Biarkan terminal ini tetap terbuka.
 
-### 3. Install dependencies Python
-```bash
-pip install -r requirements.txt
-```
+2. Download model Qwen (terminal lain):
+   ```bash
+   ollama pull qwen2.5:7b
+   ```
+   > RAM ≤8GB → `qwen2.5:3b` &nbsp;|&nbsp; RAM 16GB → `qwen2.5:7b` (default) &nbsp;|&nbsp; RAM 32GB+ → `qwen2.5:14b`
+   >
+   > Ganti pilihan model di `config.py` (`OLLAMA_MODEL_NAME`).
 
-### 4. Jalankan
+3. Install dependencies & jalankan:
+   ```bash
+   pip install -r requirements.txt
+   python main.py
+   ```
+
+### Opsi B: Mode Groq (API cloud, lebih cepat, butuh key)
+
+1. Daftar gratis di https://console.groq.com (tidak perlu kartu kredit)
+2. Buat API key baru di dashboard (menu "API Keys")
+3. **Set sebagai environment variable** (jangan ditulis di file kode):
+
+   **Mac/Linux:**
+   ```bash
+   export GROQ_API_KEY=isi_key_kamu_disini
+   export FERXVIS_LLM_PROVIDER=groq
+   python main.py
+   ```
+   **Windows (CMD):**
+   ```cmd
+   set GROQ_API_KEY=isi_key_kamu_disini
+   set FERXVIS_LLM_PROVIDER=groq
+   python main.py
+   ```
+   **Windows (PowerShell):**
+   ```powershell
+   $env:GROQ_API_KEY="isi_key_kamu_disini"
+   $env:FERXVIS_LLM_PROVIDER="groq"
+   python main.py
+   ```
+
+4. Install dependencies (sama seperti mode Ollama, tidak ada library tambahan untuk Groq
+   karena pakai koneksi HTTP standar):
+   ```bash
+   pip install -r requirements.txt
+   ```
+
+**Catatan soal model di Groq:** Default-nya `openai/gpt-oss-120b` (paling stabil untuk
+tool-calling per pengecekan terakhir, Juni 2026). Groq juga menghosting model Qwen
+(`qwen/qwen3.6-27b`), tapi ada laporan dari komunitas soal bug "empty tool call" pada
+model itu yang bisa membuat Ferxvis berhenti di tengah tugas multi-step. Kalau tetap mau
+coba Qwen di Groq:
 ```bash
-python main.py
+export FERXVIS_GROQ_MODEL=qwen/qwen3.6-27b
 ```
+Kalau ternyata macet/tidak stabil, hapus environment variable ini untuk balik ke default.
+
+Groq juga **menghapus model lama dari waktu ke waktu** (sudah terjadi beberapa kali).
+Kalau suatu saat muncul error "model tidak ditemukan", cek daftar model aktif di
+https://console.groq.com/docs/models dan update `FERXVIS_GROQ_MODEL` sesuai itu.
+
+### Beralih antar provider
+Tinggal ganti `FERXVIS_LLM_PROVIDER` ke `ollama` atau `groq` sebelum jalankan `python main.py`.
+Tidak perlu edit kode sama sekali.
+
 
 ---
 
@@ -230,9 +291,25 @@ Untuk 3 contoh terakhir, Ferxvis akan minta konfirmasi dulu sebelum benar-benar 
 
 ## 🛠️ Troubleshooting
 
-**"Ollama tidak terdeteksi"** → pastikan `ollama serve` jalan di terminal lain.
+**"Ollama tidak terdeteksi"** → pastikan `ollama serve` jalan di terminal lain, dan
+`FERXVIS_LLM_PROVIDER` tidak diset ke `groq` secara tidak sengaja (cek dengan `echo $FERXVIS_LLM_PROVIDER`).
 
 **"Model belum di-pull"** → `ollama pull qwen2.5:7b`.
+
+**GROQ_API_KEY tidak valid/sudah dicabut** → key sudah di-revoke atau expired, generate
+key baru di console.groq.com dan set ulang environment variable.
+
+**"Model tidak ditemukan di Groq"** → Groq cukup sering menghapus model lama. Cek daftar
+model aktif di https://console.groq.com/docs/models, lalu set `FERXVIS_GROQ_MODEL` ke
+model yang masih aktif.
+
+**Ferxvis berhenti di tengah tugas multi-step saat pakai Groq + Qwen** → ini bug yang
+sudah diketahui komunitas pada model `qwen/qwen3.6-27b` (kadang berhenti tanpa menyelesaikan
+tool call). Coba ganti ke model default (`openai/gpt-oss-120b`) dengan menghapus environment
+variable `FERXVIS_GROQ_MODEL`.
+
+**Rate limit Groq tercapai** → tunggu sebentar, atau cek kuota di console.groq.com. Kalau
+sering kena limit, coba model yang lebih kecil atau request lebih jarang.
 
 **GUI tidak muncul** → pastikan `pip install -r requirements.txt` selesai tanpa error.
 Di Linux, install dulu: `sudo apt install python3-tk`.

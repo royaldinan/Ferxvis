@@ -1,975 +1,565 @@
 """
-GUI Premium Ferxvis - Dark theme, sidebar, chat history, clipboard, voice, image.
-Voice: Groq Whisper API (kualitas tinggi) atau Google fallback.
-Input: Ctrl+A select all, paste gambar dari clipboard.
+GUI Ferxvis v3 - Premium Dark Theme
+Fitur: Chat History, Clipboard Manager, Voice Input, Saved Chats, Premium UI
+Kompatibel dengan repo asli royaldinan/Ferxvis
 """
 
 import threading
-import base64
-import os
-import io
 import json
-import subprocess
-import tempfile
-import wave
-from datetime import datetime
+import os
+import base64
+import datetime
 from pathlib import Path
 
 import customtkinter as ctk
-from tkinter import filedialog, messagebox
 import tkinter as tk
+from tkinter import filedialog, messagebox
 
 from core.agent import FerxvisAgent
-from core.llm_client import check_ollama_running, check_model_available, get_active_mode, get_quota_info
-from core.memory import (save_chat_history, list_chat_histories,
-                         load_chat_history, delete_chat_history,
-                         load_saved_clipboard, add_saved_clipboard_item,
-                         delete_saved_clipboard_item, clear_saved_clipboard)
-from config import AGENT_NAME, MODEL_NAME, GROQ_MODEL, GROQ_API_KEY
+from core.llm_client import check_ollama_running, check_model_available
+from config import AGENT_NAME, MODEL_NAME, WORKSPACE_DIR
 
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
 
-# ── Warna tema premium ─────────────────────────────────────────
-C_BG        = "#0f1117"
-C_SIDEBAR   = "#161b27"
-C_PANEL     = "#1c2333"
-C_BORDER    = "#2a3347"
-C_ACCENT    = "#4f8ef7"
-C_ACCENT2   = "#7c5cbf"
-C_USER_BG   = "#1e3a5f"
-C_AI_BG     = "#1a2235"
-C_TOOL_BG   = "#162012"
-C_WARN_BG   = "#2d1f00"
-C_TEXT      = "#e8eaf0"
-C_MUTED     = "#6b7a99"
-C_GREEN     = "#22c55e"
-C_RED       = "#ef4444"
-C_ORANGE    = "#f97316"
+# ── Warna Premium ──────────────────────────────────────────────
+BG          = "#0d1117"
+SIDEBAR_BG  = "#161b22"
+PANEL       = "#1c2128"
+BORDER      = "#30363d"
+ACCENT      = "#388bfd"
+ACCENT2     = "#7c5cbf"
+USER_BG     = "#1f3a5f"
+AI_BG       = "#1c2128"
+TOOL_BG     = "#0f2a1a"
+WARN_BG     = "#2d1f00"
+TEXT        = "#e6edf3"
+MUTED       = "#7d8590"
+GREEN       = "#3fb950"
+RED         = "#f85149"
+ORANGE      = "#d29922"
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+SAVED_CHATS_DIR = os.path.join(BASE_DIR, "saved_chats")
+CLIPBOARD_FILE  = os.path.join(BASE_DIR, "clipboard_saved.json")
+os.makedirs(SAVED_CHATS_DIR, exist_ok=True)
 
 
-# ── Groq Whisper voice recording ──────────────────────────────
-
-def _record_audio_pyaudio(duration_max=30, silence_timeout=2.0, stop_flag=None):
-    """Record audio pakai PyAudio dengan VAD (berhenti otomatis saat hening).
-    stop_flag: callable opsional, kalau return True maka rekaman dihentikan segera
-    (dipakai supaya window bisa ditutup paksa walau sedang merekam)."""
-    import pyaudio
-    import numpy as np
-
-    CHUNK = 1024
-    FORMAT = pyaudio.paInt16
-    CHANNELS = 1
-    RATE = 16000
-    SILENCE_THRESHOLD = 500   # RMS threshold untuk silence detection
-    SILENCE_FRAMES = int(RATE / CHUNK * silence_timeout)
-
-    pa = pyaudio.PyAudio()
-    stream = pa.open(format=FORMAT, channels=CHANNELS, rate=RATE,
-                     input=True, frames_per_buffer=CHUNK)
-
-    frames = []
-    silent_count = 0
-    started = False
-
+# ── Helper: load/save clipboard permanen ──────────────────────
+def load_saved_clipboard():
     try:
-        for _ in range(0, int(RATE / CHUNK * duration_max)):
-            if stop_flag is not None and stop_flag():
-                break  # Window ditutup / app diminta keluar — hentikan segera
-
-            data = stream.read(CHUNK, exception_on_overflow=False)
-            frames.append(data)
-
-            # RMS energy
-            audio_data = np.frombuffer(data, dtype=np.int16)
-            rms = np.sqrt(np.mean(audio_data.astype(np.float32) ** 2))
-
-            if rms > SILENCE_THRESHOLD:
-                started = True
-                silent_count = 0
-            elif started:
-                silent_count += 1
-                if silent_count >= SILENCE_FRAMES:
-                    break  # Berhenti setelah hening cukup lama
-    finally:
-        stream.stop_stream()
-        stream.close()
-        pa.terminate()
-
-    # Simpan ke file WAV sementara
-    tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
-    with wave.open(tmp.name, 'wb') as wf:
-        wf.setnchannels(CHANNELS)
-        wf.setsampwidth(pa.get_sample_size(FORMAT))
-        wf.setframerate(RATE)
-        wf.writeframes(b''.join(frames))
-
-    return tmp.name
+        if os.path.exists(CLIPBOARD_FILE):
+            with open(CLIPBOARD_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return []
 
 
-def _transcribe_groq_whisper(audio_path: str) -> str:
-    """Kirim audio ke Groq Whisper API pakai requests (bypass Cloudflare)."""
-    import requests
-
-    with open(audio_path, 'rb') as f:
-        audio_data = f.read()
-
-    headers = {
-        "Authorization": f"Bearer {GROQ_API_KEY}",
-        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    }
-    files = {
-        "file": ("audio.wav", audio_data, "audio/wav"),
-    }
-    data = {
-        "model": "whisper-large-v3",
-        "language": "id",
-        "response_format": "json",
-    }
-
-    resp = requests.post(
-        "https://api.groq.com/openai/v1/audio/transcriptions",
-        headers=headers,
-        files=files,
-        data=data,
-        timeout=30,
-    )
-
-    if not resp.ok:
-        raise Exception(f"Groq Whisper error {resp.status_code}: {resp.text}")
-
-    return resp.json().get("text", "").strip()
-def _transcribe_google_fallback(audio_path: str) -> str:
-    """Fallback ke Google Speech Recognition."""
-    import speech_recognition as sr
-    r = sr.Recognizer()
-    with sr.AudioFile(audio_path) as source:
-        audio = r.record(source)
-    return r.recognize_google(audio, language="id-ID")
+def save_clipboard_to_disk(items):
+    try:
+        with open(CLIPBOARD_FILE, "w", encoding="utf-8") as f:
+            json.dump(items, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
 
 
-# ── Sidebar ────────────────────────────────────────────────────
-
-class Sidebar(ctk.CTkFrame):
-    def __init__(self, parent, on_new_chat, on_show_history, on_show_clipboard,
-                 on_show_saved_clipboard, **kwargs):
-        super().__init__(parent, width=220, fg_color=C_SIDEBAR, corner_radius=0, **kwargs)
-        self.pack_propagate(False)
-
-        logo_frame = ctk.CTkFrame(self, fg_color="transparent")
-        logo_frame.pack(fill="x", padx=16, pady=(20, 8))
-        ctk.CTkLabel(logo_frame, text="⚡", font=ctk.CTkFont(size=28)).pack(side="left")
-        ctk.CTkLabel(logo_frame, text="Ferxvis",
-                     font=ctk.CTkFont(size=20, weight="bold"),
-                     text_color=C_TEXT).pack(side="left", padx=8)
-
-        ctk.CTkFrame(self, height=1, fg_color=C_BORDER).pack(fill="x", padx=12, pady=8)
-
-        nav_items = [
-            ("💬  Chat Baru", on_new_chat, C_ACCENT),
-            ("🕐  Riwayat Chat", on_show_history, None),
-            ("📋  Clipboard", on_show_clipboard, None),
-            ("💾  Saved Clipboard", on_show_saved_clipboard, None),
-        ]
-        for label, cmd, color in nav_items:
-            btn = ctk.CTkButton(
-                self, text=label, anchor="w", height=40,
-                fg_color=color or "transparent",
-                hover_color=C_PANEL,
-                text_color=C_TEXT,
-                font=ctk.CTkFont(size=13),
-                corner_radius=8,
-                command=cmd,
-            )
-            btn.pack(fill="x", padx=12, pady=3)
-
-        ctk.CTkFrame(self, height=1, fg_color=C_BORDER).pack(fill="x", padx=12, pady=8)
-
-        self.mode_label = ctk.CTkLabel(
-            self, text="", font=ctk.CTkFont(size=11),
-            text_color=C_MUTED, justify="left"
-        )
-        self.mode_label.pack(fill="x", padx=16, pady=4)
-
-        self.status_label = ctk.CTkLabel(
-            self, text="Mengecek...", font=ctk.CTkFont(size=11),
-            text_color=C_MUTED
-        )
-        self.status_label.pack(fill="x", padx=16)
-
-        self.quota_label = ctk.CTkLabel(
-            self, text="", font=ctk.CTkFont(size=10),
-            text_color=C_MUTED, justify="left"
-        )
-        self.quota_label.pack(fill="x", padx=16, pady=(4, 0))
-
-        ctk.CTkFrame(self, fg_color="transparent").pack(fill="both", expand=True)
-
-        ctk.CTkLabel(self, text="Ferdinand Manurung",
-                     font=ctk.CTkFont(size=11), text_color=C_MUTED).pack(padx=16, pady=(0, 4))
-        ctk.CTkLabel(self, text="Ferxvis v2.1",
-                     font=ctk.CTkFont(size=10), text_color=C_BORDER).pack(padx=16, pady=(0, 12))
-
-    def set_status(self, text, color=None):
-        self.status_label.configure(text=text, text_color=color or C_MUTED)
-
-    def set_mode(self, mode: str):
-        if mode == "groq":
-            self.mode_label.configure(
-                text="🌐 Groq API\n(Online, Cepat)",
-                text_color=C_GREEN
-            )
-        else:
-            self.mode_label.configure(
-                text="🖥️ Ollama Lokal\n(Offline Mode)",
-                text_color=C_ORANGE
-            )
-
-    def set_quota(self, remaining, limit, reset_str=None, is_stale=False):
-        """Update label sisa quota harian Groq. remaining/limit bisa None kalau belum ada data."""
-        if remaining is None or limit is None:
-            self.quota_label.configure(text="")
-            return
-
-        if is_stale:
-            # Panggilan terakhir gagal (429) tanpa header rate-limit baru —
-            # angka di bawah ini adalah data LAMA dari panggilan sukses
-            # sebelumnya, bukan kondisi saat ini. Tampilkan sebagai tidak
-            # pasti, jangan seolah-olah ini kuota terkini yang masih penuh.
-            text = f"📊 Kuota tidak pasti (terakhir kena rate limit)\n   Data lama: {remaining}/{limit}"
-            self.quota_label.configure(text=text, text_color=C_ORANGE)
-            return
-
-        pct = (remaining / limit) if limit else 0
-        if pct <= 0.1:
-            color = C_RED
-        elif pct <= 0.3:
-            color = C_ORANGE
-        else:
-            color = C_MUTED
-
-        text = f"📊 Sisa kuota: {remaining}/{limit} hari ini"
-        if reset_str:
-            text += f"\n⏱ Reset dalam: {reset_str}"
-        self.quota_label.configure(text=text, text_color=color)
+# ── Saved Chats Helper ────────────────────────────────────────
+def list_saved_chats():
+    chats = []
+    try:
+        for f in sorted(Path(SAVED_CHATS_DIR).glob("*.json"), reverse=True):
+            try:
+                with open(f, "r", encoding="utf-8") as fh:
+                    data = json.load(fh)
+                chats.append({
+                    "path": str(f),
+                    "title": data.get("title", f.stem),
+                    "date": data.get("date", ""),
+                    "messages": data.get("messages", []),
+                })
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return chats
 
 
-# ── Chat Bubble ────────────────────────────────────────────────
-
-class ChatBubble(ctk.CTkFrame):
-    def __init__(self, parent, role: str, text: str, **kwargs):
-        super().__init__(parent, fg_color="transparent", **kwargs)
-
-        color_map = {
-            "user": C_USER_BG,
-            "assistant": C_AI_BG,
-            "tool": C_TOOL_BG,
-            "system": C_WARN_BG,
-            "confirmation": C_WARN_BG,
-        }
-        bg = color_map.get(role, C_AI_BG)
-        anchor = "e" if role == "user" else "w"
-        prefix = {"user": "👤", "assistant": "⚡", "tool": "🔧", "system": "ℹ️"}.get(role, "")
-
-        container = ctk.CTkFrame(self, fg_color="transparent")
-        container.pack(fill="x", pady=2)
-
-        bubble = ctk.CTkLabel(
-            container,
-            text=f"{prefix}  {text}" if prefix else text,
-            justify="left",
-            wraplength=580,
-            fg_color=bg,
-            corner_radius=12,
-            padx=14, pady=10,
-            font=ctk.CTkFont(size=13),
-            text_color=C_TEXT,
-        )
-        bubble.pack(anchor=anchor, padx=12)
+def save_chat_to_disk(messages, title=None):
+    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    if not title:
+        user_msgs = [m for m in messages if m.get("role") == "user"]
+        title = user_msgs[0]["content"][:40] if user_msgs else "Chat"
+    safe = "".join(c for c in title if c.isalnum() or c in " _-")[:40].strip()
+    path = os.path.join(SAVED_CHATS_DIR, f"{ts}_{safe}.json")
+    exportable = [m for m in messages if m.get("role") in ("user", "assistant") and m.get("content")]
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump({
+            "title": title,
+            "date": datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),
+            "messages": exportable,
+        }, f, ensure_ascii=False, indent=2)
+    return path
 
 
-# ── History Panel ──────────────────────────────────────────────
-
-class HistoryPanel(ctk.CTkToplevel):
-    def __init__(self, parent, on_load_callback):
+# ── Panel: Saved Chats ────────────────────────────────────────
+class SavedChatsPanel(ctk.CTkToplevel):
+    def __init__(self, parent, on_load):
         super().__init__(parent)
         self.title("Riwayat Chat")
-        self.geometry("520x600")
-        self.configure(fg_color=C_BG)
-        self.on_load = on_load_callback
+        self.geometry("500x580")
+        self.configure(fg_color=BG)
+        self.on_load = on_load
         self._build()
 
     def _build(self):
-        ctk.CTkLabel(self, text="🕐  Riwayat Chat",
-                     font=ctk.CTkFont(size=16, weight="bold"),
-                     text_color=C_TEXT).pack(padx=20, pady=(20, 12))
+        ctk.CTkLabel(self, text="🕐  Riwayat Chat Tersimpan",
+                     font=ctk.CTkFont(size=15, weight="bold"),
+                     text_color=TEXT).pack(padx=20, pady=(20, 12))
 
-        self.scroll = ctk.CTkScrollableFrame(self, fg_color=C_PANEL, corner_radius=10)
+        self.scroll = ctk.CTkScrollableFrame(self, fg_color=PANEL, corner_radius=10)
         self.scroll.pack(fill="both", expand=True, padx=20, pady=(0, 20))
-        self._load_list()
+        self._refresh()
 
-    def _load_list(self):
+    def _refresh(self):
         for w in self.scroll.winfo_children():
             w.destroy()
-
-        histories = list_chat_histories()
-        if not histories:
-            ctk.CTkLabel(self.scroll, text="Belum ada riwayat chat.",
-                         text_color=C_MUTED).pack(pady=20)
+        chats = list_saved_chats()
+        if not chats:
+            ctk.CTkLabel(self.scroll, text="Belum ada chat tersimpan.",
+                         text_color=MUTED).pack(pady=20)
             return
-
-        for h in histories:
-            row = ctk.CTkFrame(self.scroll, fg_color=C_BORDER, corner_radius=8)
-            row.pack(fill="x", pady=4, padx=8)
-
+        for chat in chats:
+            row = ctk.CTkFrame(self.scroll, fg_color=BORDER, corner_radius=8)
+            row.pack(fill="x", pady=3, padx=6)
             info = ctk.CTkFrame(row, fg_color="transparent")
-            info.pack(side="left", fill="both", expand=True, padx=12, pady=8)
-
-            ctk.CTkLabel(info, text=h["title"],
+            info.pack(side="left", fill="both", expand=True, padx=10, pady=8)
+            ctk.CTkLabel(info, text=chat["title"],
                          font=ctk.CTkFont(size=13, weight="bold"),
-                         text_color=C_TEXT, anchor="w").pack(fill="x")
-            ctk.CTkLabel(info,
-                         text=f"{h['message_count']} pesan  •  {h['saved_at'][:16].replace('T', ' ')}",
-                         font=ctk.CTkFont(size=11), text_color=C_MUTED, anchor="w").pack(fill="x")
-
+                         text_color=TEXT, anchor="w").pack(fill="x")
+            ctk.CTkLabel(info, text=f"{chat['date']} · {len(chat['messages'])} pesan",
+                         font=ctk.CTkFont(size=11), text_color=MUTED, anchor="w").pack(fill="x")
+            p = chat["path"]
+            m = chat["messages"]
             btns = ctk.CTkFrame(row, fg_color="transparent")
             btns.pack(side="right", padx=8)
-
-            fp = h["filepath"]
             ctk.CTkButton(btns, text="Buka", width=60, height=28,
-                          fg_color=C_ACCENT, hover_color="#3a7be0",
-                          command=lambda f=fp: self._load(f)).pack(side="left", padx=2)
+                          fg_color=ACCENT, hover_color="#2d75d4",
+                          command=lambda msgs=m: self._load(msgs)).pack(side="left", padx=2)
             ctk.CTkButton(btns, text="Hapus", width=60, height=28,
-                          fg_color=C_RED, hover_color="#cc2222",
-                          command=lambda f=fp: self._delete(f)).pack(side="left", padx=2)
+                          fg_color=RED, hover_color="#c04040",
+                          command=lambda fp=p: self._delete(fp)).pack(side="left", padx=2)
 
-    def _load(self, filepath):
-        msgs = load_chat_history(filepath)
-        self.on_load(msgs)
+    def _load(self, messages):
+        self.on_load(messages)
         self.destroy()
 
-    def _delete(self, filepath):
-        delete_chat_history(filepath)
-        self._load_list()
+    def _delete(self, path):
+        try:
+            os.remove(path)
+        except Exception:
+            pass
+        self._refresh()
 
 
-# ── Clipboard Panel ────────────────────────────────────────────
-
+# ── Panel: Clipboard Manager ──────────────────────────────────
 class ClipboardPanel(ctk.CTkToplevel):
-    def __init__(self, parent, on_paste_callback):
+    def __init__(self, parent, on_paste):
         super().__init__(parent)
         self.title("Clipboard Manager")
-        self.geometry("520x580")
-        self.configure(fg_color=C_BG)
-        self.on_paste = on_paste_callback
-        self.items = []
+        self.geometry("460x540")
+        self.configure(fg_color=BG)
+        self.on_paste = on_paste
+        self.session_items = []
+        self.saved_items = load_saved_clipboard()
+        self._last_clip = ""
         self._build()
-        self._start_monitor()
+        self._monitor()
 
     def _build(self):
-        header = ctk.CTkFrame(self, fg_color="transparent")
-        header.pack(fill="x", padx=20, pady=(20, 8))
+        top = ctk.CTkFrame(self, fg_color="transparent")
+        top.pack(fill="x", padx=16, pady=(16, 4))
+        ctk.CTkLabel(top, text="📋  Clipboard Manager",
+                     font=ctk.CTkFont(size=15, weight="bold"),
+                     text_color=TEXT).pack(side="left")
+        ctk.CTkButton(top, text="Hapus Semua", width=100, height=28,
+                      fg_color=RED, hover_color="#c04040",
+                      command=self._clear_session).pack(side="right")
 
-        ctk.CTkLabel(header, text="📋  Clipboard",
-                     font=ctk.CTkFont(size=16, weight="bold"),
-                     text_color=C_TEXT).pack(side="left")
+        # Tab session vs saved
+        self.tab = ctk.CTkTabview(self, fg_color=PANEL)
+        self.tab.pack(fill="both", expand=True, padx=16, pady=8)
+        self.tab.add("Session")
+        self.tab.add("Tersimpan")
 
-        ctk.CTkButton(header, text="🗑 Bersihkan", width=100, height=30,
-                      fg_color=C_RED, hover_color="#cc2222",
-                      command=self._clear).pack(side="right")
+        self.session_scroll = ctk.CTkScrollableFrame(self.tab.tab("Session"), fg_color="transparent")
+        self.session_scroll.pack(fill="both", expand=True)
 
-        ctk.CTkLabel(self,
-                     text="Copy sesuatu untuk menyimpannya di sini.",
-                     font=ctk.CTkFont(size=11), text_color=C_MUTED).pack()
+        self.saved_scroll = ctk.CTkScrollableFrame(self.tab.tab("Tersimpan"), fg_color="transparent")
+        self.saved_scroll.pack(fill="both", expand=True)
 
-        self.scroll = ctk.CTkScrollableFrame(self, fg_color=C_PANEL, corner_radius=10)
-        self.scroll.pack(fill="both", expand=True, padx=20, pady=12)
-
-    def _start_monitor(self):
-        self._last = ""
-        self._monitor()
+        self._refresh_session()
+        self._refresh_saved()
 
     def _monitor(self):
         try:
             import pyperclip
             current = pyperclip.paste()
-            if current and current != self._last and len(current.strip()) > 0:
-                self._last = current
-                self._add_item(current)
+            if current and current != self._last_clip and len(current.strip()) > 0:
+                self._last_clip = current
+                if not any(i["text"] == current for i in self.session_items):
+                    self.session_items.insert(0, {"text": current, "time": datetime.datetime.now().strftime("%H:%M:%S")})
+                    if len(self.session_items) > 30:
+                        self.session_items = self.session_items[:30]
+                    self._refresh_session()
         except Exception:
             pass
         if self.winfo_exists():
             self.after(1000, self._monitor)
 
-    def _add_item(self, text: str):
-        if any(i["text"] == text for i in self.items):
-            return
-        self.items.insert(0, {"text": text, "time": datetime.now().strftime("%H:%M:%S")})
-        if len(self.items) > 50:
-            self.items = self.items[:50]
-        self._refresh_list()
-
-    def _refresh_list(self):
-        for w in self.scroll.winfo_children():
+    def _refresh_session(self):
+        for w in self.session_scroll.winfo_children():
             w.destroy()
-
-        for item in self.items:
-            row = ctk.CTkFrame(self.scroll, fg_color=C_BORDER, corner_radius=8)
-            row.pack(fill="x", pady=3, padx=4)
-
-            # Preview teks
-            preview = item["text"][:100].replace("\n", " ")
-            ctk.CTkLabel(
-                row, text=preview,
-                font=ctk.CTkFont(size=12), text_color=C_TEXT,
-                anchor="w", wraplength=280, justify="left"
-            ).pack(side="left", padx=10, pady=8, fill="both", expand=True)
-
-            # Tombol-tombol di kanan
-            btns = ctk.CTkFrame(row, fg_color="transparent")
-            btns.pack(side="right", padx=6, pady=6)
-
-            t = item["text"]
-
-            ctk.CTkLabel(btns, text=item["time"],
-                         font=ctk.CTkFont(size=10), text_color=C_MUTED).pack()
-
-            btn_row = ctk.CTkFrame(btns, fg_color="transparent")
-            btn_row.pack(pady=(2, 0))
-
-            # Tombol Copy — copy ulang ke clipboard sistem
-            ctk.CTkButton(
-                btn_row, text="📋 Copy", width=58, height=26,
-                fg_color=C_ACCENT2, hover_color="#6448a8",
-                font=ctk.CTkFont(size=11),
-                command=lambda txt=t: self._copy_to_clipboard(txt)
-            ).pack(side="left", padx=(0, 3))
-
-            # Tombol Simpan — simpan permanen ke Saved Clipboard (persist ke disk)
-            ctk.CTkButton(
-                btn_row, text="💾 Simpan", width=58, height=26,
-                fg_color="transparent", border_width=1, border_color=C_BORDER,
-                hover_color=C_PANEL, text_color=C_TEXT,
-                font=ctk.CTkFont(size=11),
-                command=lambda txt=t: self._save_permanently(txt)
-            ).pack(side="left", padx=(0, 3))
-
-            # Tombol Kirim — kirim ke input box AI
-            ctk.CTkButton(
-                btn_row, text="➤ Kirim", width=58, height=26,
-                fg_color=C_ACCENT, hover_color="#3a7be0",
-                font=ctk.CTkFont(size=11),
-                command=lambda txt=t: self.on_paste(txt)
-            ).pack(side="left")
-
-    def _save_permanently(self, text: str):
-        """Simpan item ini ke Saved Clipboard (persist, tidak hilang saat ditutup)."""
-        added = add_saved_clipboard_item(text)
-        if not added:
-            messagebox.showinfo("Saved Clipboard", "Item ini sudah ada di Saved Clipboard.")
-
-    def _copy_to_clipboard(self, text: str):
-        """Copy item kembali ke clipboard sistem."""
-        try:
-            import pyperclip
-            pyperclip.copy(text)
-            # Visual feedback singkat tidak bisa di label yang berbeda thread, skip aja
-        except Exception:
-            pass
-
-    def _clear(self):
-        self.items = []
-        self._refresh_list()
-
-
-# ── Saved Clipboard Panel ──────────────────────────────────────
-# Beda dari ClipboardPanel di atas: panel ini menampilkan item yang
-# SUDAH disimpan secara permanen (lewat tombol "💾 Simpan" di ClipboardPanel,
-# atau ditambah langsung dari sini). Data persist ke saved_clipboard.json,
-# sama seperti "Simpan Chat" persist ke chat_histories/, jadi tetap ada
-# walau panel ditutup atau Ferxvis dibuka ulang.
-
-class SavedClipboardPanel(ctk.CTkToplevel):
-    def __init__(self, parent, on_paste_callback):
-        super().__init__(parent)
-        self.title("Saved Clipboard")
-        self.geometry("520x600")
-        self.configure(fg_color=C_BG)
-        self.on_paste = on_paste_callback
-        self._build()
-
-    def _build(self):
-        header = ctk.CTkFrame(self, fg_color="transparent")
-        header.pack(fill="x", padx=20, pady=(20, 8))
-
-        ctk.CTkLabel(header, text="💾  Saved Clipboard",
-                     font=ctk.CTkFont(size=16, weight="bold"),
-                     text_color=C_TEXT).pack(side="left")
-
-        ctk.CTkButton(header, text="🗑 Bersihkan Semua", width=130, height=30,
-                      fg_color=C_RED, hover_color="#cc2222",
-                      command=self._clear_all).pack(side="right")
-
-        ctk.CTkLabel(self,
-                     text="Item yang disimpan permanen dari Clipboard tetap ada di sini.",
-                     font=ctk.CTkFont(size=11), text_color=C_MUTED).pack()
-
-        self.scroll = ctk.CTkScrollableFrame(self, fg_color=C_PANEL, corner_radius=10)
-        self.scroll.pack(fill="both", expand=True, padx=20, pady=12)
-        self._load_list()
-
-    def _load_list(self):
-        for w in self.scroll.winfo_children():
-            w.destroy()
-
-        items = load_saved_clipboard()
-        if not items:
-            ctk.CTkLabel(self.scroll, text="Belum ada item yang disimpan.",
-                         text_color=C_MUTED).pack(pady=20)
+        if not self.session_items:
+            ctk.CTkLabel(self.session_scroll, text="Belum ada clipboard.", text_color=MUTED).pack(pady=12)
             return
+        for item in self.session_items:
+            self._render_item(self.session_scroll, item, saved=False)
 
-        for item in items:
-            row = ctk.CTkFrame(self.scroll, fg_color=C_BORDER, corner_radius=8)
-            row.pack(fill="x", pady=3, padx=4)
+    def _refresh_saved(self):
+        for w in self.saved_scroll.winfo_children():
+            w.destroy()
+        if not self.saved_items:
+            ctk.CTkLabel(self.saved_scroll, text="Belum ada clipboard tersimpan.", text_color=MUTED).pack(pady=12)
+            return
+        for item in self.saved_items:
+            self._render_item(self.saved_scroll, item, saved=True)
 
-            preview = item["text"][:100].replace("\n", " ")
-            ctk.CTkLabel(
-                row, text=preview,
-                font=ctk.CTkFont(size=12), text_color=C_TEXT,
-                anchor="w", wraplength=280, justify="left"
-            ).pack(side="left", padx=10, pady=8, fill="both", expand=True)
+    def _render_item(self, parent, item, saved):
+        row = ctk.CTkFrame(parent, fg_color=BORDER, corner_radius=8)
+        row.pack(fill="x", pady=3, padx=4)
+        preview = item["text"][:100].replace("\n", " ")
+        ctk.CTkLabel(row, text=preview, font=ctk.CTkFont(size=12),
+                     text_color=TEXT, anchor="w", wraplength=280,
+                     justify="left").pack(side="left", padx=10, pady=6, fill="both", expand=True)
+        btns = ctk.CTkFrame(row, fg_color="transparent")
+        btns.pack(side="right", padx=6, pady=4)
+        t = item["text"]
+        ctk.CTkButton(btns, text="Kirim", width=52, height=24,
+                      fg_color=ACCENT, hover_color="#2d75d4",
+                      command=lambda txt=t: self.on_paste(txt)).pack(pady=1)
+        ctk.CTkButton(btns, text="Copy", width=52, height=24,
+                      fg_color=PANEL, hover_color=BORDER,
+                      command=lambda txt=t: self._copy(txt)).pack(pady=1)
+        if not saved:
+            ctk.CTkButton(btns, text="Simpan", width=52, height=24,
+                          fg_color=ACCENT2, hover_color="#6b4aad",
+                          command=lambda i=item: self._save_item(i)).pack(pady=1)
+        else:
+            ctk.CTkButton(btns, text="Hapus", width=52, height=24,
+                          fg_color=RED, hover_color="#c04040",
+                          command=lambda i=item: self._delete_saved(i)).pack(pady=1)
 
-            btns = ctk.CTkFrame(row, fg_color="transparent")
-            btns.pack(side="right", padx=6, pady=6)
-
-            t = item["text"]
-            saved_at = item.get("saved_at", "")
-
-            ctk.CTkLabel(btns, text=saved_at[:16].replace("T", " "),
-                         font=ctk.CTkFont(size=10), text_color=C_MUTED).pack()
-
-            btn_row = ctk.CTkFrame(btns, fg_color="transparent")
-            btn_row.pack(pady=(2, 0))
-
-            ctk.CTkButton(
-                btn_row, text="📋 Copy", width=58, height=26,
-                fg_color=C_ACCENT2, hover_color="#6448a8",
-                font=ctk.CTkFont(size=11),
-                command=lambda txt=t: self._copy_to_clipboard(txt)
-            ).pack(side="left", padx=(0, 3))
-
-            ctk.CTkButton(
-                btn_row, text="➤ Kirim", width=58, height=26,
-                fg_color=C_ACCENT, hover_color="#3a7be0",
-                font=ctk.CTkFont(size=11),
-                command=lambda txt=t: self.on_paste(txt)
-            ).pack(side="left", padx=(0, 3))
-
-            ctk.CTkButton(
-                btn_row, text="🗑", width=30, height=26,
-                fg_color=C_RED, hover_color="#cc2222",
-                font=ctk.CTkFont(size=11),
-                command=lambda sa=saved_at: self._delete_item(sa)
-            ).pack(side="left")
-
-    def _copy_to_clipboard(self, text: str):
+    def _copy(self, text):
         try:
             import pyperclip
             pyperclip.copy(text)
         except Exception:
             pass
 
-    def _delete_item(self, saved_at: str):
-        delete_saved_clipboard_item(saved_at)
-        self._load_list()
+    def _save_item(self, item):
+        if not any(i["text"] == item["text"] for i in self.saved_items):
+            self.saved_items.insert(0, item)
+            save_clipboard_to_disk(self.saved_items)
+            self._refresh_saved()
 
-    def _clear_all(self):
-        clear_saved_clipboard()
-        self._load_list()
+    def _delete_saved(self, item):
+        self.saved_items = [i for i in self.saved_items if i["text"] != item["text"]]
+        save_clipboard_to_disk(self.saved_items)
+        self._refresh_saved()
+
+    def _clear_session(self):
+        self.session_items = []
+        self._refresh_session()
 
 
-# ── Main Chat Window ───────────────────────────────────────────
+# ── Bubble Widget ─────────────────────────────────────────────
+class Bubble(ctk.CTkFrame):
+    def __init__(self, parent, role, text, **kw):
+        super().__init__(parent, fg_color="transparent", **kw)
+        colors = {"user": USER_BG, "assistant": AI_BG, "tool": TOOL_BG, "system": WARN_BG, "confirmation": WARN_BG}
+        bg = colors.get(role, AI_BG)
+        anchor = "e" if role == "user" else "w"
+        icons = {"user": "👤", "assistant": "⚡", "tool": "🔧", "system": "ℹ️"}
+        icon = icons.get(role, "")
+        label_text = f"{icon}  {text}" if icon else text
+        container = ctk.CTkFrame(self, fg_color="transparent")
+        container.pack(fill="x", pady=2)
+        ctk.CTkLabel(
+            container, text=label_text, justify="left",
+            wraplength=600, fg_color=bg, corner_radius=12,
+            padx=14, pady=10, font=ctk.CTkFont(size=13), text_color=TEXT,
+        ).pack(anchor=anchor, padx=12)
 
+
+# ── Main Window ───────────────────────────────────────────────
 class ChatWindow(ctk.CTk):
     def __init__(self):
         super().__init__()
         self.title(f"{AGENT_NAME} — Asisten AI Personal")
-        self.geometry("1100x720")
-        self.minsize(800, 560)
-        self.configure(fg_color=C_BG)
+        self.geometry("1060x700")
+        self.minsize(780, 540)
+        self.configure(fg_color=BG)
 
         self.agent = FerxvisAgent(restore_memory=True)
-        self._confirmation_frame = None
+        self._confirm_frame = None
         self._pending_image = None
-        self._clipboard_panel = None
-        self._saved_clipboard_panel = None
-        self._is_recording = False
-        self._is_closing = False
+        self._clipboard_win = None
 
-        self._build_ui()
+        self._build()
         self._check_startup()
         self._replay_history()
 
-        # Pastikan window benar-benar tertutup walau ada thread (voice/API)
-        # yang masih jalan di background — tanpa ini, klik X bisa terasa
-        # "tidak merespon" karena tkinter menunggu thread non-daemon/blocking.
-        self.protocol("WM_DELETE_WINDOW", self._on_close)
+    def _build(self):
+        root = ctk.CTkFrame(self, fg_color="transparent")
+        root.pack(fill="both", expand=True)
 
-    def _on_close(self):
-        """Handler saat window ditutup (klik X / Alt+F4 / close all)."""
-        self._is_closing = True
-        try:
-            self.destroy()
-        except Exception:
-            pass
-        # Paksa keluar proses segera. Thread voice/HTTP yang masih
-        # berjalan di background (daemon) tidak akan menahan proses,
-        # tapi os._exit memastikan tidak ada yang nyangkut sama sekali.
-        os._exit(0)
+        # ── Sidebar ──
+        sb = ctk.CTkFrame(root, width=210, fg_color=SIDEBAR_BG, corner_radius=0)
+        sb.pack(side="left", fill="y")
+        sb.pack_propagate(False)
 
-    def _build_ui(self):
-        main = ctk.CTkFrame(self, fg_color="transparent")
-        main.pack(fill="both", expand=True)
+        logo = ctk.CTkFrame(sb, fg_color="transparent")
+        logo.pack(fill="x", padx=14, pady=(18, 6))
+        ctk.CTkLabel(logo, text="⚡", font=ctk.CTkFont(size=26)).pack(side="left")
+        ctk.CTkLabel(logo, text="Ferxvis", font=ctk.CTkFont(size=18, weight="bold"),
+                     text_color=TEXT).pack(side="left", padx=8)
 
-        self.sidebar = Sidebar(
-            main,
-            on_new_chat=self._on_new_chat,
-            on_show_history=self._on_show_history,
-            on_show_clipboard=self._on_show_clipboard,
-            on_show_saved_clipboard=self._on_show_saved_clipboard,
-        )
-        self.sidebar.pack(side="left", fill="y")
+        ctk.CTkFrame(sb, height=1, fg_color=BORDER).pack(fill="x", padx=10, pady=6)
 
-        right = ctk.CTkFrame(main, fg_color=C_BG, corner_radius=0)
+        nav = [
+            ("💬  Chat Baru", self._new_chat, ACCENT),
+            ("🕐  Riwayat Chat", self._show_history, None),
+            ("📋  Clipboard", self._show_clipboard, None),
+        ]
+        for label, cmd, color in nav:
+            ctk.CTkButton(sb, text=label, anchor="w", height=38,
+                          fg_color=color or "transparent", hover_color=PANEL,
+                          text_color=TEXT, font=ctk.CTkFont(size=13),
+                          corner_radius=8, command=cmd).pack(fill="x", padx=10, pady=2)
+
+        ctk.CTkFrame(sb, fg_color="transparent").pack(fill="both", expand=True)
+        self.mode_lbl = ctk.CTkLabel(sb, text="", font=ctk.CTkFont(size=11), text_color=MUTED)
+        self.mode_lbl.pack(padx=14, pady=2)
+        self.status_lbl = ctk.CTkLabel(sb, text="Mengecek...", font=ctk.CTkFont(size=11), text_color=MUTED)
+        self.status_lbl.pack(padx=14)
+        ctk.CTkLabel(sb, text="Ferdinand Manurung", font=ctk.CTkFont(size=10), text_color=MUTED).pack(padx=14, pady=(8, 2))
+        ctk.CTkLabel(sb, text="Ferxvis v3.0", font=ctk.CTkFont(size=10), text_color=BORDER).pack(padx=14, pady=(0, 12))
+
+        # ── Right panel ──
+        right = ctk.CTkFrame(root, fg_color=BG, corner_radius=0)
         right.pack(side="left", fill="both", expand=True)
 
         # Topbar
-        topbar = ctk.CTkFrame(right, height=52, fg_color=C_PANEL, corner_radius=0)
+        topbar = ctk.CTkFrame(right, height=50, fg_color=PANEL, corner_radius=0)
         topbar.pack(fill="x")
         topbar.pack_propagate(False)
-
         ctk.CTkLabel(topbar, text=f"⚡ {AGENT_NAME}",
-                     font=ctk.CTkFont(size=15, weight="bold"),
-                     text_color=C_TEXT).pack(side="left", padx=20)
+                     font=ctk.CTkFont(size=14, weight="bold"), text_color=TEXT).pack(side="left", padx=18)
+        tbr = ctk.CTkFrame(topbar, fg_color="transparent")
+        tbr.pack(side="right", padx=10)
+        for lbl, cmd in [("💾 Simpan Chat", self._save_chat),
+                          ("🖼️ Kirim Gambar", self._attach_image),
+                          ("🎤 Suara", self._voice_input)]:
+            ctk.CTkButton(tbr, text=lbl, width=110 if lbl != "🎤 Suara" else 80,
+                          height=30, fg_color="transparent",
+                          border_width=1, border_color=BORDER,
+                          hover_color=PANEL, text_color=TEXT,
+                          command=cmd).pack(side="left", padx=3)
 
-        btn_frame = ctk.CTkFrame(topbar, fg_color="transparent")
-        btn_frame.pack(side="right", padx=12)
+        ctk.CTkFrame(right, height=1, fg_color=BORDER).pack(fill="x")
 
-        ctk.CTkButton(btn_frame, text="💾 Simpan Chat", width=110, height=30,
-                      fg_color="transparent", border_width=1, border_color=C_BORDER,
-                      hover_color=C_PANEL, text_color=C_TEXT,
-                      command=self._on_save_chat).pack(side="left", padx=4)
-
-        ctk.CTkButton(btn_frame, text="🖼️ Kirim Gambar", width=110, height=30,
-                      fg_color="transparent", border_width=1, border_color=C_BORDER,
-                      hover_color=C_PANEL, text_color=C_TEXT,
-                      command=self._on_attach_image).pack(side="left", padx=4)
-
-        self.voice_btn = ctk.CTkButton(
-            btn_frame, text="🎤 Suara", width=90, height=30,
-            fg_color="transparent", border_width=1, border_color=C_BORDER,
-            hover_color=C_PANEL, text_color=C_TEXT,
-            command=self._on_voice_input
-        )
-        self.voice_btn.pack(side="left", padx=4)
-
-        ctk.CTkFrame(right, height=1, fg_color=C_BORDER).pack(fill="x")
-
-        self.chat_frame = ctk.CTkScrollableFrame(right, fg_color=C_BG, label_text="")
-        self.chat_frame.pack(fill="both", expand=True, padx=0, pady=0)
+        # Chat area
+        self.chat_area = ctk.CTkScrollableFrame(right, fg_color=BG)
+        self.chat_area.pack(fill="both", expand=True)
 
         # Image preview bar (hidden)
-        self.img_bar = ctk.CTkFrame(right, fg_color=C_PANEL, height=60)
+        self.img_bar = ctk.CTkFrame(right, fg_color=PANEL, height=52)
 
-        # Input area
-        input_area = ctk.CTkFrame(right, fg_color=C_PANEL, corner_radius=0)
-        input_area.pack(fill="x", side="bottom")
-
-        ctk.CTkFrame(input_area, height=1, fg_color=C_BORDER).pack(fill="x")
-
-        input_row = ctk.CTkFrame(input_area, fg_color="transparent")
-        input_row.pack(fill="x", padx=16, pady=12)
-
+        # Input bar
+        inbar = ctk.CTkFrame(right, fg_color=PANEL, corner_radius=0)
+        inbar.pack(fill="x", side="bottom")
+        ctk.CTkFrame(inbar, height=1, fg_color=BORDER).pack(fill="x")
+        inrow = ctk.CTkFrame(inbar, fg_color="transparent")
+        inrow.pack(fill="x", padx=14, pady=10)
         self.input_box = ctk.CTkTextbox(
-            input_row, height=52, fg_color=C_BORDER,
-            border_width=0, corner_radius=10,
-            font=ctk.CTkFont(size=13), text_color=C_TEXT,
-            scrollbar_button_color=C_BORDER,
-        )
+            inrow, height=50, fg_color=BORDER, border_width=0,
+            corner_radius=10, font=ctk.CTkFont(size=13), text_color=TEXT)
         self.input_box.pack(side="left", fill="x", expand=True, padx=(0, 10))
-
-        # Keybinds input box
         self.input_box.bind("<Return>", self._on_enter)
-        self.input_box.bind("<Shift-Return>", lambda e: None)
-        self.input_box.bind("<Control-a>", self._on_ctrl_a)
-        self.input_box.bind("<Control-A>", self._on_ctrl_a)
-        self.input_box.bind("<Control-v>", self._on_ctrl_v)
-        self.input_box.bind("<Control-V>", self._on_ctrl_v)
-
         self.send_btn = ctk.CTkButton(
-            input_row, text="Kirim ➤", width=90, height=52,
-            fg_color=C_ACCENT, hover_color="#3a7be0",
-            font=ctk.CTkFont(size=13, weight="bold"),
-            corner_radius=10,
-            command=self._on_send,
-        )
+            inrow, text="Kirim ➤", width=90, height=50,
+            fg_color=ACCENT, hover_color="#2d75d4",
+            font=ctk.CTkFont(size=13, weight="bold"), corner_radius=10,
+            command=self._send)
         self.send_btn.pack(side="right")
-
-    # ── Startup check ──────────────────────────────────────────
 
     def _check_startup(self):
         def task():
-            mode = get_active_mode()
-            if mode == "groq":
-                status = ("🟢 Groq API Aktif", C_GREEN)
-                mode_str = "☁️ Groq API (cepat)"
-            else:
-                ollama_ok = check_ollama_running()
-                model_ok = check_model_available() if ollama_ok else False
-                if not ollama_ok:
-                    status = ("❌ Ollama tidak jalan", C_RED)
-                elif not model_ok:
-                    status = ("⚠️ Model belum di-pull", C_ORANGE)
-                else:
-                    status = ("🟡 Ollama Lokal", C_ORANGE)
-                mode_str = "🖥️ Ollama Lokal"
-
+            ollama_ok = check_ollama_running()
+            model_ok = check_model_available() if ollama_ok else False
             def ui():
-                self.sidebar.set_mode(mode)
-                self.sidebar.set_status(status[0], status[1])
+                if False:
+                    self.mode_lbl.configure(text="🌐 Groq API\n(Online, Cepat)", text_color=GREEN)
+                    self.status_lbl.configure(text="🟢 Groq Aktif", text_color=GREEN)
+                elif not ollama_ok:
+                    self.mode_lbl.configure(text="🖥️ Ollama Lokal", text_color=ORANGE)
+                    self.status_lbl.configure(text="❌ Ollama tidak jalan", text_color=RED)
+                elif not model_ok:
+                    self.mode_lbl.configure(text="🖥️ Ollama Lokal", text_color=ORANGE)
+                    self.status_lbl.configure(text="⚠️ Model belum di-pull", text_color=ORANGE)
+                else:
+                    self.mode_lbl.configure(text="🖥️ Ollama Lokal", text_color=ORANGE)
+                    self.status_lbl.configure(text="🟡 Ollama Aktif", text_color=ORANGE)
                 if len(self.agent.history) <= 1:
-                    self._add_bubble(
-                        "assistant",
-                        f"Halo, Ferdinand! Saya Ferxvis, asisten AI personal kamu. "
-                        f"Mode aktif: {mode_str}. Ada yang bisa saya bantu hari ini?"
-                    )
+                    mode_str = "Groq API (cepat)" if LLM_PROVIDER == "groq" else "Ollama Lokal"
+                    self._bubble("assistant", f"Halo Ferdinand! Saya {AGENT_NAME}, asisten AI personal kamu. Mode: {mode_str}. Ada yang bisa dibantu?")
             self.after(0, ui)
         threading.Thread(target=task, daemon=True).start()
 
     def _replay_history(self):
-        for msg in self.agent.history:
-            role = msg.get("role")
-            content = msg.get("content", "")
-            if role == "user" and content:
-                self._add_bubble("user", content)
-            elif role == "assistant" and content:
-                self._add_bubble("assistant", content)
+        for m in self.agent.history:
+            role, content = m.get("role"), m.get("content", "")
+            if role in ("user", "assistant") and content:
+                self._bubble(role, content)
 
-    def _add_bubble(self, role: str, text: str):
-        bubble = ChatBubble(self.chat_frame, role=role, text=text)
-        bubble.pack(fill="x", pady=2, padx=8)
+    def _bubble(self, role, text):
+        b = Bubble(self.chat_area, role=role, text=text)
+        b.pack(fill="x", pady=2, padx=6)
         self.after(60, self._scroll_bottom)
-
-    def _add_confirmation_buttons(self):
-        frame = ctk.CTkFrame(self.chat_frame, fg_color="transparent")
-        frame.pack(fill="x", pady=6, padx=20)
-        inner = ctk.CTkFrame(frame, fg_color="transparent")
-        inner.pack(anchor="w")
-        ctk.CTkButton(inner, text="✅ Ya, lanjutkan", width=140, height=36,
-                      fg_color=C_GREEN, hover_color="#16a34a",
-                      font=ctk.CTkFont(size=13, weight="bold"),
-                      command=lambda: self._on_confirm(True)).pack(side="left", padx=(0, 8))
-        ctk.CTkButton(inner, text="❌ Batalkan", width=120, height=36,
-                      fg_color=C_RED, hover_color="#cc2222",
-                      font=ctk.CTkFont(size=13, weight="bold"),
-                      command=lambda: self._on_confirm(False)).pack(side="left")
-        self._confirmation_frame = frame
-        self.after(60, self._scroll_bottom)
-
-    def _remove_confirmation_buttons(self):
-        if self._confirmation_frame:
-            self._confirmation_frame.destroy()
-            self._confirmation_frame = None
+        return b
 
     def _scroll_bottom(self):
-        self.chat_frame._parent_canvas.yview_moveto(1.0)
+        self.chat_area._parent_canvas.yview_moveto(1.0)
 
-    # ── Input keybinds ─────────────────────────────────────────
-
-    def _on_enter(self, event):
-        self._on_send()
+    def _on_enter(self, e):
+        self._send()
         return "break"
 
-    def _on_ctrl_a(self, event):
-        """Ctrl+A: select all teks di input box."""
-        self.input_box.tag_add("sel", "1.0", "end")
-        return "break"
-
-    def _on_ctrl_v(self, event):
-        """Ctrl+V: paste teks atau gambar dari clipboard."""
-        # Coba dulu gambar dari clipboard (PIL)
-        try:
-            from PIL import ImageGrab, Image
-            img = ImageGrab.grabclipboard()
-            if img is not None and hasattr(img, 'mode'):
-                # Ada gambar di clipboard
-                buf = io.BytesIO()
-                img.save(buf, format="PNG")
-                b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
-                self._pending_image = {"base64": b64, "media_type": "image/png"}
-
-                # Tampilkan preview bar
-                for w in self.img_bar.winfo_children():
-                    w.destroy()
-                ctk.CTkLabel(
-                    self.img_bar,
-                    text=f"🖼️  Gambar dari clipboard ({img.width}×{img.height})  — siap dikirim",
-                    font=ctk.CTkFont(size=12), text_color=C_TEXT
-                ).pack(side="left", padx=16, pady=8)
-                ctk.CTkButton(
-                    self.img_bar, text="✕", width=30, height=30,
-                    fg_color="transparent", hover_color=C_BORDER,
-                    text_color=C_MUTED, command=self._cancel_image
-                ).pack(side="right", padx=8)
-                self.img_bar.pack(fill="x", before=self.chat_frame)
-                return "break"
-        except Exception:
-            pass
-
-        # Kalau bukan gambar, biarkan Ctrl+V default paste teks
-        return None
-
-    # ── Send / confirm ─────────────────────────────────────────
-
-    def _on_send(self):
+    def _send(self):
         if self.agent.awaiting_confirmation:
-            self._add_bubble("system", "Gunakan tombol Ya/Tidak untuk konfirmasi terlebih dahulu.")
+            self._bubble("system", "Gunakan tombol Ya/Tidak untuk konfirmasi.")
             return
         text = self.input_box.get("1.0", "end").strip()
         if not text and not self._pending_image:
             return
         self.input_box.delete("1.0", "end")
-
-        display_text = text or "[Gambar dikirim]"
-        self._add_bubble("user", display_text)
-        self._set_input_enabled(False)
-
+        self._bubble("user", text or "[Gambar]")
+        self._set_enabled(False)
         if self.img_bar.winfo_ismapped():
             self.img_bar.pack_forget()
-
-        image_data = self._pending_image
+        img = self._pending_image
         self._pending_image = None
-
-        thinking = self._add_thinking_bubble()
+        thinking = self._bubble("assistant", "💭 Sedang berpikir...")
 
         def task():
             def on_tool(name, args, result):
-                self.after(0, lambda: self._add_bubble(
-                    "tool", f"{name}({self._fmt(args)})\n→ {result[:200]}"
-                ))
+                self.after(0, lambda: self._bubble("tool", f"{name}()\n→ {str(result)[:200]}"))
             try:
-                reply = self.agent.send(text, on_tool_call=on_tool, image_data=image_data)
+                reply = self.agent.send(text, on_tool_call=on_tool)
             except Exception as e:
                 reply = f"⚠️ Error: {e}"
             self.after(0, lambda: self._finish(thinking, reply))
 
         threading.Thread(target=task, daemon=True).start()
 
-    def _add_thinking_bubble(self):
-        frame = ctk.CTkFrame(self.chat_frame, fg_color=C_AI_BG, corner_radius=12)
-        frame.pack(anchor="w", padx=20, pady=4)
-        label = ctk.CTkLabel(frame, text="⚡  Sedang berpikir...",
-                             font=ctk.CTkFont(size=13), text_color=C_MUTED,
-                             padx=14, pady=10)
-        label.pack()
-        self.after(60, self._scroll_bottom)
-        return frame
-
-    def _finish(self, thinking_widget, reply: str):
-        thinking_widget.destroy()
-        self._add_bubble("assistant", reply)
-        self._refresh_quota_label()
+    def _finish(self, thinking, reply):
+        thinking.destroy()
+        self._bubble("assistant", reply)
         if self.agent.awaiting_confirmation:
-            self._add_confirmation_buttons()
-            self._set_input_enabled(False)
+            self._show_confirm_buttons()
         else:
-            self._set_input_enabled(True)
+            self._set_enabled(True)
         self._scroll_bottom()
 
-    def _refresh_quota_label(self):
-        try:
-            info = get_quota_info()
-            self.sidebar.set_quota(
-                info.get("remaining_requests"),
-                info.get("limit_requests"),
-                info.get("reset_requests"),
-                info.get("is_stale", False),
-            )
-        except Exception:
-            pass  # quota display tidak boleh sampai bikin chat error
+    def _show_confirm_buttons(self):
+        frame = ctk.CTkFrame(self.chat_area, fg_color="transparent")
+        frame.pack(fill="x", pady=6, padx=20)
+        inner = ctk.CTkFrame(frame, fg_color="transparent")
+        inner.pack(anchor="w")
+        ctk.CTkButton(inner, text="✅ Ya, lanjutkan", width=140, height=36,
+                      fg_color=GREEN, hover_color="#2ea043",
+                      font=ctk.CTkFont(size=13, weight="bold"),
+                      command=lambda: self._confirm(True)).pack(side="left", padx=(0, 8))
+        ctk.CTkButton(inner, text="❌ Batalkan", width=120, height=36,
+                      fg_color=RED, hover_color="#c04040",
+                      font=ctk.CTkFont(size=13, weight="bold"),
+                      command=lambda: self._confirm(False)).pack(side="left")
+        self._confirm_frame = frame
+        self._scroll_bottom()
 
-    def _on_confirm(self, yes: bool):
-        self._remove_confirmation_buttons()
-        self._add_bubble("user", "✅ Ya, lanjutkan" if yes else "❌ Batalkan")
-        thinking = self._add_thinking_bubble()
-        self._set_input_enabled(False)
-
+    def _confirm(self, yes):
+        if self._confirm_frame:
+            self._confirm_frame.destroy()
+            self._confirm_frame = None
+        self._bubble("user", "✅ Ya" if yes else "❌ Tidak")
+        thinking = self._bubble("assistant", "💭 Memproses...")
         def task():
             try:
                 reply = self.agent.resolve_confirmation(yes)
             except Exception as e:
                 reply = f"⚠️ Error: {e}"
             self.after(0, lambda: self._finish(thinking, reply))
-
         threading.Thread(target=task, daemon=True).start()
 
-    def _set_input_enabled(self, enabled: bool):
+    def _set_enabled(self, enabled):
         state = "normal" if enabled else "disabled"
         self.input_box.configure(state=state)
         self.send_btn.configure(state=state, text="Kirim ➤" if enabled else "...")
 
-    # ── Nav actions ────────────────────────────────────────────
-
-    def _on_new_chat(self):
+    # ── Actions ──
+    def _new_chat(self):
         self.agent.reset()
-        for w in self.chat_frame.winfo_children():
+        for w in self.chat_area.winfo_children():
             w.destroy()
-        self._confirmation_frame = None
+        self._confirm_frame = None
         self._pending_image = None
         if self.img_bar.winfo_ismapped():
             self.img_bar.pack_forget()
-        self._add_bubble("assistant", "Percakapan baru dimulai. Ada yang bisa saya bantu?")
+        self._set_enabled(True)
+        self._bubble("assistant", "Percakapan baru dimulai. Ada yang bisa saya bantu?")
 
-    def _on_save_chat(self):
-        msgs = self.agent.history
-        user_msgs = [m for m in msgs if m.get("role") == "user"]
-        title = user_msgs[0]["content"][:30] if user_msgs else "Chat"
-        save_chat_history(msgs, title)
-        self._add_bubble("system", "✅ Chat disimpan.")
+    def _save_chat(self):
+        try:
+            save_chat_to_disk(self.agent.history)
+            self._bubble("system", "✅ Chat berhasil disimpan.")
+        except Exception as e:
+            self._bubble("system", f"❌ Gagal simpan: {e}")
 
-    def _on_show_history(self):
+    def _show_history(self):
         def on_load(messages):
-            self.agent.load_history(messages)
-            for w in self.chat_frame.winfo_children():
+            for w in self.chat_area.winfo_children():
                 w.destroy()
-            self._replay_history()
-            self._add_bubble("system", "✅ Riwayat chat berhasil dimuat.")
-        HistoryPanel(self, on_load_callback=on_load)
+            self.agent.history = [self.agent.history[0]] + messages
+            for m in messages:
+                if m.get("role") in ("user", "assistant") and m.get("content"):
+                    self._bubble(m["role"], m["content"])
+            self._bubble("system", "✅ Riwayat chat dimuat.")
+        SavedChatsPanel(self, on_load)
 
-    def _on_show_clipboard(self):
-        if self._clipboard_panel and self._clipboard_panel.winfo_exists():
-            self._clipboard_panel.lift()
+    def _show_clipboard(self):
+        if self._clipboard_win and self._clipboard_win.winfo_exists():
+            self._clipboard_win.lift()
             return
         def on_paste(text):
             self.input_box.delete("1.0", "end")
             self.input_box.insert("1.0", text)
-        self._clipboard_panel = ClipboardPanel(self, on_paste_callback=on_paste)
+        self._clipboard_win = ClipboardPanel(self, on_paste)
 
-    def _on_show_saved_clipboard(self):
-        if self._saved_clipboard_panel and self._saved_clipboard_panel.winfo_exists():
-            self._saved_clipboard_panel.lift()
-            return
-        def on_paste(text):
-            self.input_box.delete("1.0", "end")
-            self.input_box.insert("1.0", text)
-        self._saved_clipboard_panel = SavedClipboardPanel(self, on_paste_callback=on_paste)
-
-    # ── Image attach ───────────────────────────────────────────
-
-    def _on_attach_image(self):
+    def _attach_image(self):
         fp = filedialog.askopenfilename(
             title="Pilih Gambar",
-            filetypes=[("Image files", "*.png *.jpg *.jpeg *.gif *.webp *.bmp")]
+            filetypes=[("Image", "*.png *.jpg *.jpeg *.gif *.webp *.bmp")]
         )
         if not fp:
             return
@@ -978,111 +568,40 @@ class ChatWindow(ctk.CTk):
                 raw = f.read()
             b64 = base64.b64encode(raw).decode("utf-8")
             ext = Path(fp).suffix.lower()
-            mt_map = {".jpg": "image/jpeg", ".jpeg": "image/jpeg",
-                      ".png": "image/png", ".gif": "image/gif",
-                      ".webp": "image/webp", ".bmp": "image/bmp"}
-            mt = mt_map.get(ext, "image/jpeg")
+            mt = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png",
+                  ".gif": "image/gif", ".webp": "image/webp"}.get(ext, "image/jpeg")
             self._pending_image = {"base64": b64, "media_type": mt}
-
             for w in self.img_bar.winfo_children():
                 w.destroy()
-            ctk.CTkLabel(self.img_bar,
-                         text=f"🖼️  {Path(fp).name}  — siap dikirim",
-                         font=ctk.CTkFont(size=12), text_color=C_TEXT).pack(side="left", padx=16, pady=8)
-            ctk.CTkButton(self.img_bar, text="✕", width=30, height=30,
-                          fg_color="transparent", hover_color=C_BORDER,
-                          text_color=C_MUTED, command=self._cancel_image).pack(side="right", padx=8)
-            self.img_bar.pack(fill="x", before=self.chat_frame)
+            ctk.CTkLabel(self.img_bar, text=f"🖼️ {Path(fp).name}",
+                         font=ctk.CTkFont(size=12), text_color=TEXT).pack(side="left", padx=16)
+            ctk.CTkButton(self.img_bar, text="✕", width=28, height=28,
+                          fg_color="transparent", hover_color=BORDER, text_color=MUTED,
+                          command=lambda: (self.img_bar.pack_forget(), setattr(self, "_pending_image", None))
+                          ).pack(side="right", padx=8)
+            self.img_bar.pack(fill="x", before=self.chat_area)
         except Exception as e:
             messagebox.showerror("Error", f"Gagal buka gambar: {e}")
 
-    def _cancel_image(self):
-        self._pending_image = None
-        self.img_bar.pack_forget()
-
-    # ── Voice input (Groq Whisper) ─────────────────────────────
-
-    def _on_voice_input(self):
-        if self._is_recording:
-            return
-        self._is_recording = True
-        self.voice_btn.configure(text="🔴 Rekam...", fg_color=C_RED, state="disabled")
-
+    def _voice_input(self):
+        self.send_btn.configure(text="🔴...", state="disabled")
         def task():
-            audio_path = None
             try:
-                # Install pyaudio kalau belum ada
-                try:
-                    import pyaudio
-                except ImportError:
-                    import subprocess
-                    subprocess.run(["pip3", "install", "pyaudio", "--break-system-packages"],
-                                   capture_output=True)
-                    import pyaudio
-
-                # Update UI: sedang merekam
-                self.after(0, lambda: self.voice_btn.configure(text="🎙 Mendengar..."))
-
-                # Rekam audio dengan VAD
-                audio_path = _record_audio_pyaudio(
-                    duration_max=30, silence_timeout=1.5,
-                    stop_flag=lambda: self._is_closing
-                )
-
-                # Update UI: sedang transkripsi
-                self.after(0, lambda: self.voice_btn.configure(text="⏳ Proses..."))
-
-                # Transkripsi: Groq Whisper jika API key ada dan internet, else Google
-                if GROQ_API_KEY and _check_internet_quick():
-                    text = _transcribe_groq_whisper(audio_path)
-                else:
-                    text = _transcribe_google_fallback(audio_path)
-
-                if text:
-                    self.after(0, lambda: self._insert_voice_text(text))
-                else:
-                    self.after(0, lambda: self._add_bubble("system", "⚠️ Tidak ada suara yang terdeteksi."))
-
-            except Exception as e:
-                err = str(e)
-                self.after(0, lambda: self._add_bubble("system", f"⚠️ Voice error: {err}"))
-            finally:
-                if audio_path and os.path.exists(audio_path):
-                    try:
-                        os.unlink(audio_path)
-                    except Exception:
-                        pass
-                self._is_recording = False
-                self.after(0, lambda: self.voice_btn.configure(
-                    text="🎤 Suara", fg_color="transparent", state="normal"
+                import speech_recognition as sr
+                r = sr.Recognizer()
+                with sr.Microphone() as src:
+                    r.adjust_for_ambient_noise(src, duration=0.5)
+                    audio = r.listen(src, timeout=10, phrase_time_limit=30)
+                text = r.recognize_google(audio, language="id-ID")
+                self.after(0, lambda: (
+                    self.input_box.delete("1.0", "end"),
+                    self.input_box.insert("1.0", text)
                 ))
-
+            except Exception as e:
+                self.after(0, lambda: self._bubble("system", f"⚠️ Voice error: {e}"))
+            finally:
+                self.after(0, lambda: self.send_btn.configure(text="Kirim ➤", state="normal"))
         threading.Thread(target=task, daemon=True).start()
-
-    def _insert_voice_text(self, text: str):
-        self.input_box.delete("1.0", "end")
-        self.input_box.insert("1.0", text)
-        self.input_box.focus_set()
-
-    # ── Helpers ────────────────────────────────────────────────
-
-    @staticmethod
-    def _fmt(args: dict) -> str:
-        parts = []
-        for k, v in args.items():
-            s = str(v)
-            parts.append(f"{k}={s[:30]}{'...' if len(s) > 30 else ''}")
-        return ", ".join(parts)
-
-
-def _check_internet_quick() -> bool:
-    import socket
-    try:
-        socket.setdefaulttimeout(3)
-        socket.socket(socket.AF_INET, socket.SOCK_STREAM).connect(("8.8.8.8", 53))
-        return True
-    except Exception:
-        return False
 
 
 def run_gui():

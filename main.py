@@ -1,15 +1,21 @@
-#!/usr/bin/env python3
 """
-Ferxvis v2.0 - Entry point
+Ferxvis - Asisten AI Lokal
+===========================
+Jalankan file ini untuk membuka aplikasi.
+
+    python main.py
 """
 
 import sys
-import os
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, BASE_DIR)
-
+# Inisialisasi folder __init__.py kalau dijalankan pertama kali (lihat setup di README)
 from gui.chat_window import run_gui
 
-if __name__ == "__main__":
+
+def main():
+    print("Memulai Ferxvis...")
     run_gui()
+
+
+if __name__ == "__main__":
+    main()

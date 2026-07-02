@@ -1,0 +1,108 @@
+"""
+Konfigurasi Ferxvis.
+Ubah nilai-nilai di sini sesuai kebutuhan kamu.
+"""
+
+import os
+
+# ── LLM Settings ──────────────────────────────────────────────
+# LLM_PROVIDER: "ollama" (lokal, gratis, perlu install Ollama) atau "groq" (API cloud, butuh API key)
+LLM_PROVIDER = "ollama"
+
+# -- Ollama (lokal) --
+OLLAMA_HOST = "http://localhost:11434"   # Default Ollama, jangan diubah kalau install standar
+OLLAMA_MODEL_NAME = "qwen2.5:7b"          # Ganti ke qwen2.5:14b/32b kalau laptop kuat, qwen2.5:3b kalau RAM kecil
+
+# -- Groq (API cloud) --
+# API key TIDAK PERNAH ditulis di file ini. Selalu diambil dari environment variable.
+# Cara isi (jangan taruh di kode, jangan share ke siapapun):
+#   Mac/Linux : export GROQ_API_KEY=isi_key_kamu
+#   Windows   : set GROQ_API_KEY=isi_key_kamu   (atau lewat PowerShell: $env:GROQ_API_KEY="...")
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
+GROQ_BASE_URL = "https://api.groq.com/openai/v1"
+GROQ_MODEL_NAME = os.environ.get("FERXVIS_GROQ_MODEL", "qwen/qwen3-32b")
+# ^ Default dipilih karena tool-calling-nya paling stabil di Groq saat ini.
+#   Qwen di Groq (qwen/qwen3.6-27b) JUGA mendukung tool use, tapi ada laporan bug dari komunitas
+#   soal "empty tool call" yang bisa membuat agent loop berhenti di tengah tugas multi-step.
+#   Kalau tetap mau pakai Qwen, set environment variable:
+#     FERXVIS_GROQ_MODEL=qwen/qwen3.6-27b
+#   Cek daftar model aktif terbaru di https://console.groq.com/docs/models sebelum ganti.
+
+MODEL_NAME = OLLAMA_MODEL_NAME if LLM_PROVIDER == "ollama" else GROQ_MODEL_NAME
+
+# ── Sandbox Settings ──────────────────────────────────────────
+# Ferxvis HANYA boleh baca/tulis/hapus file di dalam folder ini.
+# Ini demi keamanan - supaya AI tidak bisa menyentuh file sistem
+# atau folder pribadi kamu di luar area yang diizinkan.
+#
+# Defaultnya folder "workspace" di sebelah file ini.
+# Kamu bisa ganti ke folder lain, misal:
+#   WORKSPACE_DIR = r"D:\FerxvisWorkspace"   (Windows)
+#   WORKSPACE_DIR = "/Users/namamu/FerxvisWorkspace"  (Mac)
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+WORKSPACE_DIR = os.path.expanduser("~")  # Akses penuh ke home folder
+
+# Pastikan folder workspace ada
+os.makedirs(WORKSPACE_DIR, exist_ok=True)
+
+# ── Agent Settings ────────────────────────────────────────────
+MAX_TOOL_ITERATIONS = 8     # Maksimal berapa kali Ferxvis boleh panggil tool berturut-turut
+                             # sebelum dipaksa kasih jawaban final (mencegah loop tak berhenti)
+
+AGENT_NAME = "Ferxvis"
+
+# ── Web Search Settings ──────────────────────────────────────
+# Pakai Brave Search API (ada free tier 2000 query/bulan): https://brave.com/search/api/
+# Daftar gratis, dapatkan API key, lalu isi di bawah ini ATAU lewat environment variable
+# BRAVE_API_KEY supaya tidak hardcode di file ini.
+BRAVE_API_KEY = os.environ.get("BRAVE_API_KEY", "")
+
+# ── Email (Gmail) Settings ───────────────────────────────────
+# Pakai Gmail API resmi via OAuth - TIDAK pernah simpan password asli kamu.
+# Setup: lihat README.md bagian "Setup Email (Gmail)".
+GMAIL_CREDENTIALS_FILE = os.path.join(BASE_DIR, "credentials.json")  # Download dari Google Cloud Console
+GMAIL_TOKEN_FILE = os.path.join(BASE_DIR, "gmail_token.json")         # Auto-generated setelah login pertama
+
+# ── WhatsApp Business API Settings ───────────────────────────
+# Pakai WhatsApp Business Cloud API resmi dari Meta (BUKAN library unofficial).
+# Setup: lihat README.md bagian "Setup WhatsApp".
+WHATSAPP_ACCESS_TOKEN = os.environ.get("WHATSAPP_ACCESS_TOKEN", "")
+WHATSAPP_PHONE_NUMBER_ID = os.environ.get("WHATSAPP_PHONE_NUMBER_ID", "")
+
+# ── Aksi Sensitif - Konfirmasi Wajib ─────────────────────────
+# Tool-tool ini akan SELALU minta konfirmasi user dulu sebelum dieksekusi,
+# karena dampaknya keluar dari sandbox lokal (kirim email, kirim WA) atau
+# tidak bisa dibatalkan (hapus file/folder).
+TOOLS_REQUIRING_CONFIRMATION = {
+    "delete_file",
+    "send_email",
+    "send_whatsapp_message",
+}
+
+# ── Memory Settings ───────────────────────────────────────────
+MEMORY_FILE = os.path.join(BASE_DIR, "memory.json")
+MAX_HISTORY_MESSAGES = 30   # Berapa banyak pesan terakhir yang disimpan ke memory (mencegah file membengkak)
+
+SYSTEM_PROMPT = f"""Kamu adalah {AGENT_NAME}, asisten AI personal yang ramah, ringkas, dan proaktif.
+Kamu bisa membantu mengelola file, folder, dokumen Office, mencari info di internet, membaca/mengirim
+email, dan mengirim pesan WhatsApp (lewat WhatsApp Business API resmi).
+
+ATURAN PENTING:
+1. Kamu HANYA boleh mengakses file/folder di dalam workspace yang diizinkan. Semua path yang
+   kamu gunakan di tool akan otomatis dibatasi ke workspace ini - jangan coba akses path di luar itu.
+2. Selalu konfirmasi singkat ke user setelah melakukan aksi (misal: "Sudah saya buat folder X
+   dan taruh catatan di dalamnya.").
+3. Kalau instruksi user ambigu (misal nama file/folder tidak disebut), buat asumsi yang wajar
+   dan sebutkan asumsi itu ke user, jangan tanya balik kalau tidak perlu.
+4. Jawab dalam Bahasa Indonesia, gaya santai tapi jelas, seperti asisten pribadi yang kompeten.
+5. Kalau user hanya mengajak ngobrol biasa (bukan minta aksi file), jawab langsung tanpa
+   memanggil tool apapun.
+6. Untuk pertanyaan yang butuh info terkini (berita, harga, cuaca, hal yang mungkin berubah
+   setelah pengetahuanmu), gunakan tool search_web.
+7. WAJIB: Sebelum move_file atau delete_file, SELALU list_files dulu untuk cek nama file yang benar. Jangan tebak nama file.
+7. Untuk aksi yang sensitif (mengirim email, mengirim WhatsApp, menghapus file), sistem akan
+   otomatis meminta konfirmasi user sebelum benar-benar dieksekusi - kamu tidak perlu menanyakan
+   ulang, cukup panggil tool-nya seperti biasa.
+"""
+

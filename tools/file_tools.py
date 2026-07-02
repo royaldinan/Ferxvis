@@ -1,106 +1,128 @@
 """
-File tools - akses penuh ke seluruh home directory user.
+Tools untuk operasi file & folder.
+
+PENTING - SANDBOX SECURITY:
+Semua fungsi di sini memaksa path yang diberikan untuk tetap berada di dalam
+WORKSPACE_DIR (lihat config.py). Ini dilakukan dengan resolve_safe_path(),
+yang akan menolak path apapun yang mencoba "keluar" dari workspace
+(misal lewat "../../../Windows/System32" atau path absolut ke folder lain).
+
+Jangan hapus / lewati pemanggilan resolve_safe_path() di fungsi manapun.
 """
 
 import os
-import re
 import shutil
 from pathlib import Path
 
-from config import WORKSPACE_DIR, HOME_DIR
-
-# Pola placeholder gaya template yang TIDAK PERNAH boleh masuk ke isi file asli
-# (mis. "{isi_email_terakhir}", "{nama_kontak}") — kalau ini lolos sampai sini,
-# artinya tool/LLM sebelumnya gagal mengambil data asli tapi tetap mencoba
-# menulis seolah-olah berhasil. Mencegah ini lebih murah daripada percaya
-# pada hasil yang sudah ditulis ke disk.
-_PLACEHOLDER_PATTERN = re.compile(r"\{[a-zA-Z_][a-zA-Z0-9_]*\}")
+from config import WORKSPACE_DIR
 
 
-def _looks_like_unresolved_placeholder(content: str) -> bool:
-    """True kalau seluruh (atau hampir seluruh) konten cuma placeholder
-    literal yang gak ke-substitusi, bukan isi/teks asli."""
-    if not content:
-        return False
-    stripped = content.strip()
-    # Heuristik: kalau setelah menghapus semua match placeholder, sisa teksnya
-    # sangat pendek/kosong, berarti konten itu memang cuma placeholder polos.
-    without_placeholders = _PLACEHOLDER_PATTERN.sub("", stripped)
-    return bool(_PLACEHOLDER_PATTERN.search(stripped)) and len(without_placeholders) < 5
+class SandboxViolationError(Exception):
+    """Dilempar saat ada upaya mengakses path di luar workspace."""
+    pass
 
 
-def _resolve_path(relative_path: str) -> Path:
-    """Resolve path - support absolute dan relative (relatif ke home)."""
-    rp = (relative_path or "").strip()
-    if os.path.isabs(rp):
-        target = Path(rp).resolve()
-    else:
-        target = (Path(HOME_DIR) / rp).resolve()
-    return target
+def resolve_safe_path(relative_path: str) -> Path:
+    """
+    Ubah path yang diminta (relatif terhadap workspace) menjadi path absolut yang aman.
+    Menolak path yang mencoba keluar dari WORKSPACE_DIR.
+    """
+    relative_path = (relative_path or "").strip()
+
+    # PENTING: Path absolut (mis. "/etc/passwd" atau "C:\Windows") harus ditolak total,
+    # JANGAN digabung dengan workspace_root, karena pathlib akan menggantikan base path
+    # sepenuhnya kalau bagian kedua adalah path absolut (Path("/a") / "/b" == Path("/b")).
+    # Strip semua leading slash/backslash dan drive letter Windows (mis. "C:") supaya
+    # path selalu diperlakukan sebagai relatif terhadap workspace.
+    relative_path = relative_path.strip("/\\")
+    if len(relative_path) >= 2 and relative_path[1] == ":":
+        # Buang drive letter gaya Windows, contoh "C:\Windows" -> "Windows"
+        relative_path = relative_path[2:].strip("/\\")
+
+    workspace_root = Path(WORKSPACE_DIR).resolve()
+
+    # Gabungkan dengan workspace root, lalu resolve untuk menormalkan ../ dsb
+    candidate = (workspace_root / relative_path).resolve()
+
+    # Cek: apakah candidate masih di dalam workspace_root?
+    try:
+        candidate.relative_to(workspace_root)
+    except ValueError:
+        raise SandboxViolationError(
+            f"Akses ditolak: '{relative_path}' mengarah ke luar workspace yang diizinkan "
+            f"({workspace_root}). Ferxvis hanya boleh bekerja di dalam workspace."
+        )
+
+    return candidate
 
 
 def _display_path(target: Path) -> str:
-    try:
-        return str(target.relative_to(HOME_DIR))
-    except ValueError:
-        return str(target)
+    """Path relatif terhadap workspace, untuk ditampilkan di pesan ke user (akurat, bukan input mentah)."""
+    workspace_root = Path(WORKSPACE_DIR).resolve()
+    rel = target.relative_to(workspace_root)
+    return str(rel) if str(rel) != "." else "(folder utama workspace)"
 
 
 def list_files(relative_path: str = "") -> str:
-    target = _resolve_path(relative_path or HOME_DIR)
+    """List semua file & folder di dalam path (relatif terhadap workspace)."""
+    try:
+        target = resolve_safe_path(relative_path)
+    except SandboxViolationError as e:
+        return f"ERROR: {e}"
+
     if not target.exists():
-        return f"Folder '{relative_path}' tidak ditemukan."
+        return f"Folder '{relative_path or '.'}' tidak ditemukan di workspace."
+
     if not target.is_dir():
         return f"'{relative_path}' adalah file, bukan folder."
 
     items = sorted(target.iterdir(), key=lambda p: (p.is_file(), p.name.lower()))
     if not items:
-        return f"Folder '{_display_path(target)}' kosong."
+        return f"Folder '{relative_path or '.'}' kosong."
 
     lines = []
     for item in items:
-        if item.name.startswith("."):
-            continue
         kind = "📁" if item.is_dir() else "📄"
-        size = ""
-        if item.is_file():
-            s = item.stat().st_size
-            size = f" ({s//1024}KB)" if s > 1024 else f" ({s}B)"
-        lines.append(f"{kind} {item.name}{size}")
-    return "\n".join(lines) if lines else f"Folder '{_display_path(target)}' kosong (atau hanya hidden files)."
+        lines.append(f"{kind} {item.name}")
+    return "\n".join(lines)
 
 
 def create_folder(relative_path: str) -> str:
-    target = _resolve_path(relative_path)
+    """Buat folder baru (termasuk parent folder kalau belum ada) di dalam workspace."""
+    try:
+        target = resolve_safe_path(relative_path)
+    except SandboxViolationError as e:
+        return f"ERROR: {e}"
+
     if target.exists():
-        return f"Folder '{_display_path(target)}' sudah ada."
+        return f"Folder '{_display_path(target)}' sudah ada, tidak dibuat ulang."
+
     target.mkdir(parents=True, exist_ok=True)
     return f"Folder '{_display_path(target)}' berhasil dibuat."
 
 
 def write_note(relative_path: str, content: str) -> str:
-    if _looks_like_unresolved_placeholder(content):
-        return (
-            f"❌ GAGAL: konten yang akan ditulis ke '{relative_path}' cuma berisi "
-            f"placeholder yang belum ke-isi ('{content.strip()}'), bukan teks asli. "
-            "Tidak ditulis ke file. Kemungkinan langkah sebelumnya (mis. ambil data "
-            "dari email/sumber lain) gagal — cek dan ambil data aslinya dulu."
-        )
-    target = _resolve_path(relative_path)
+    """
+    Buat atau timpa file teks (catatan) di dalam workspace.
+    Kalau parent folder belum ada, akan dibuat otomatis.
+    """
+    try:
+        target = resolve_safe_path(relative_path)
+    except SandboxViolationError as e:
+        return f"ERROR: {e}"
+
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(content, encoding="utf-8")
-    return f"File '{_display_path(target)}' berhasil disimpan."
+    return f"Catatan berhasil disimpan di '{_display_path(target)}'."
 
 
 def append_note(relative_path: str, content: str) -> str:
-    if _looks_like_unresolved_placeholder(content):
-        return (
-            f"❌ GAGAL: konten yang akan ditambahkan ke '{relative_path}' cuma berisi "
-            f"placeholder yang belum ke-isi ('{content.strip()}'), bukan teks asli. "
-            "Tidak ditambahkan ke file. Kemungkinan langkah sebelumnya gagal — cek dan "
-            "ambil data aslinya dulu."
-        )
-    target = _resolve_path(relative_path)
+    """Tambahkan teks ke akhir file yang sudah ada (atau buat baru kalau belum ada)."""
+    try:
+        target = resolve_safe_path(relative_path)
+    except SandboxViolationError as e:
+        return f"ERROR: {e}"
+
     target.parent.mkdir(parents=True, exist_ok=True)
     with target.open("a", encoding="utf-8") as f:
         if target.exists() and target.stat().st_size > 0:
@@ -110,46 +132,54 @@ def append_note(relative_path: str, content: str) -> str:
 
 
 def read_file(relative_path: str) -> str:
-    target = _resolve_path(relative_path)
+    """Baca isi sebuah file teks di dalam workspace."""
+    try:
+        target = resolve_safe_path(relative_path)
+    except SandboxViolationError as e:
+        return f"ERROR: {e}"
+
     if not target.exists():
         return f"File '{relative_path}' tidak ditemukan."
     if not target.is_file():
-        return f"'{relative_path}' adalah folder."
+        return f"'{relative_path}' adalah folder, bukan file."
+
     try:
         return target.read_text(encoding="utf-8")
     except UnicodeDecodeError:
-        return f"File '{relative_path}' bukan file teks (kemungkinan binary)."
+        return f"File '{relative_path}' bukan file teks biasa (kemungkinan biner)."
 
 
 def move_file(source_relative_path: str, destination_relative_path: str) -> str:
-    source = _resolve_path(source_relative_path)
-    destination = _resolve_path(destination_relative_path)
+    """Pindahkan file/folder dari satu lokasi ke lokasi lain, masih di dalam workspace."""
+    try:
+        source = resolve_safe_path(source_relative_path)
+        destination = resolve_safe_path(destination_relative_path)
+    except SandboxViolationError as e:
+        return f"ERROR: {e}"
+
     if not source.exists():
         return f"'{source_relative_path}' tidak ditemukan."
+
     destination.parent.mkdir(parents=True, exist_ok=True)
+
+    # Kalau destination adalah folder yang sudah ada, pindahkan ke dalamnya
     if destination.exists() and destination.is_dir():
         destination = destination / source.name
+
     shutil.move(str(source), str(destination))
-    return f"Berhasil dipindahkan ke '{_display_path(destination)}'."
-
-
-def copy_file(source_relative_path: str, destination_relative_path: str) -> str:
-    source = _resolve_path(source_relative_path)
-    destination = _resolve_path(destination_relative_path)
-    if not source.exists():
-        return f"'{source_relative_path}' tidak ditemukan."
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    if source.is_dir():
-        shutil.copytree(str(source), str(destination))
-    else:
-        shutil.copy2(str(source), str(destination))
-    return f"Berhasil dicopy ke '{_display_path(destination)}'."
+    return f"Berhasil dipindahkan dari '{_display_path(source)}' ke '{_display_path(destination)}'."
 
 
 def delete_file(relative_path: str) -> str:
-    target = _resolve_path(relative_path)
+    """Hapus file atau folder (beserta isinya) di dalam workspace."""
+    try:
+        target = resolve_safe_path(relative_path)
+    except SandboxViolationError as e:
+        return f"ERROR: {e}"
+
     if not target.exists():
-        return f"'{relative_path}' tidak ditemukan."
+        return f"'{relative_path}' tidak ditemukan, tidak ada yang dihapus."
+
     display = _display_path(target)
     if target.is_dir():
         shutil.rmtree(target)
@@ -157,29 +187,3 @@ def delete_file(relative_path: str) -> str:
     else:
         target.unlink()
         return f"File '{display}' berhasil dihapus."
-
-
-def rename_file(relative_path: str, new_name: str) -> str:
-    target = _resolve_path(relative_path)
-    if not target.exists():
-        return f"'{relative_path}' tidak ditemukan."
-    new_target = target.parent / new_name
-    target.rename(new_target)
-    return f"Berhasil diubah namanya menjadi '{new_name}'."
-
-
-def search_files(query: str, search_path: str = "") -> str:
-    """Cari file berdasarkan nama di dalam folder."""
-    base = _resolve_path(search_path) if search_path else Path(HOME_DIR)
-    results = []
-    try:
-        for p in base.rglob(f"*{query}*"):
-            if not any(part.startswith(".") for part in p.parts):
-                results.append(str(p))
-            if len(results) >= 20:
-                break
-    except Exception:
-        pass
-    if not results:
-        return f"Tidak ada file yang cocok dengan '{query}'."
-    return "File ditemukan:\n" + "\n".join(results[:20])

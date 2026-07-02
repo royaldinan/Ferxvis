@@ -14,13 +14,11 @@ import sys
 # Pastikan bisa import config.py dari folder ferxvis
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from config import EMAIL_ACCOUNTS, DEFAULT_EMAIL_ACCOUNT
+from config import GMAIL_CREDENTIALS_FILE, GMAIL_TOKEN_FILE
 
-info = EMAIL_ACCOUNTS[DEFAULT_EMAIL_ACCOUNT]
-creds_file = info["credentials_file"]
-token_file = info["token_file"]
+creds_file = GMAIL_CREDENTIALS_FILE
+token_file = GMAIL_TOKEN_FILE
 
-print(f"Akun        : {info['address']}")
 print(f"creds_file  : {creds_file}  (exists={os.path.exists(creds_file)})")
 print(f"token_file  : {token_file}  (exists={os.path.exists(token_file)})")
 print()
